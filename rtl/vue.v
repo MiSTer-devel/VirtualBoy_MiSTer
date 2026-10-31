@@ -28,13 +28,19 @@ endmodule
 
 // Hardware wait-state generator for the VUE bus regions.
 //
-// Models only original-hardware READY behavior: the WCR-programmed ROM/EXP
-// waits (2 waits, or 1 with the WCR bit set, per the Sacred Tech Scroll), the
-// fixed one-wait regions, and the VIP holding READY during its own accesses.
-// The MiSTer SDRAM backup hold is NOT part of the real console and is applied
-// outside this module, ANDed into the CPU READY pin (see virtualboy.v).
+// Models only original-hardware READY behavior: the WCR-programmed ROM/SRAM/EXP
+// waits (2 waits, or 1 with the WCR bit set), the fixed one-wait regions, and
+// the VIP holding READY during its own accesses. The MiSTer SDRAM backup hold
+// is applied outside this module, ANDed into the CPU READY pin.
 // Timing runs on CE: a one-wait access spends one CE cycle reading and one
 // waiting, and the CPU latches DIN at the CE edge that ends the wait.
+//
+// Every 320 clocks the WRAM refresh pulses for 6 clocks, and no cycle starts
+// until 2 clocks after the pulse. It starts on an idle clock, or on a T1 once
+// it has waited behind a cycle, so back-to-back cycles cannot keep it off; a
+// T1 on the clock it falls due goes first. A cycle in any region waits it
+// out, then takes its normal wait; VIP accesses are held off the VIP until
+// it ends.
 module vb_vue_wait_control
 (
 	input  wire        clk_i,
@@ -62,6 +68,8 @@ module vb_vue_wait_control
 	input  wire        wait_rom1_i,
 	input  wire        vip_ready_i,
 	output wire        ready_o,
+	input  wire        refresh_tick_i,    // The prescaler's 320-clock tick: refresh falls due.
+	output wire        refresh_busy_o,
 	input  wire [63:0] savestate_state_wdata_i,
 	input  wire        savestate_state_wren_i,
 	output wire [63:0] savestate_state_rdata_o
@@ -81,26 +89,40 @@ module vb_vue_wait_control
 	reg        wait_use_vip_q;
 	reg [1:0]  wait_count_start_r;
 	reg        wait_use_vip_r;
+	reg        refresh_due_q;
+	reg [3:0]  refresh_left_q;
+	reg        refresh_wait_q;
 
-	wire       txn_change_w =
-		(txn_addr_q != a_i) ||
-		(txn_be_q != be_i) ||
-		(txn_st_q != st_i) ||
-		(txn_da_q != da_i) ||
-		(txn_rw_q != rw_i);
-	wire       txn_start_w = mrq_i && (!txn_active_q || bcyst_i || txn_change_w);
+	// Every cycle and split beat shows a T1 first, and MRQ is masked in T1,
+	// so a new access always starts from an idle transaction.
+	wire       txn_start_w = mrq_i && !txn_active_q;
+`ifndef SYNTHESIS
+	// synthesis translate_off
+	always @(posedge clk_i) begin
+		if (!reset_i && ce_i && mrq_i && txn_active_q && (bcyst_i || (txn_addr_q != a_i) ||
+			(txn_be_q != be_i) || (txn_st_q != st_i) || (txn_da_q != da_i) || (txn_rw_q != rw_i))) begin
+			$display("FAIL wait control: a new access without an idle transaction at %h", {a_i, 1'b0});
+			$fatal(1);
+		end
+	end
+	// synthesis translate_on
+`endif
+	// Pulse and the two clocks after it.
+	localparam [3:0] REFRESH_HOLD = 4'd8;
+	wire       refresh_start_w = refresh_due_q && !mrq_i && (!bcyst_i || refresh_wait_q);
+	wire       refresh_block_w = txn_start_w && (refresh_left_q != 4'd0);
+	assign     refresh_busy_o = (refresh_left_q != 4'd0);
 
 	always @(*) begin
 		wait_count_start_r = WAIT_NONE;
 		wait_use_vip_r     = 1'b0;
 
+		// WCR sets only the ROM and expansion waits; cartridge RAM is a fixed 1.
 		if (rom_cs_i) begin
 			wait_count_start_r = wait_rom1_i ? WAIT_1 : WAIT_2;
-		end else if (sram_cs_i) begin
-			wait_count_start_r = WAIT_1;
 		end else if (exp_cs_i) begin
 			wait_count_start_r = wait_exp1_i ? WAIT_1 : WAIT_2;
-		end else if (wram_cs_i || unused_cs_i || misc_cs_i || vsu_cs_i) begin
+		end else if (sram_cs_i || wram_cs_i || unused_cs_i || misc_cs_i || vsu_cs_i) begin
 			wait_count_start_r = WAIT_1;
 		end else if (vip_cs_i) begin
 			wait_use_vip_r     = 1'b1;
@@ -109,17 +131,44 @@ module vb_vue_wait_control
 
 	// READY is a live logical acceptance signal: combinational after the
 	// registered wait count (and the VIP hold) so the CPU can consume it with
-	// DIN at the very CE edge the wait expires.
+	// DIN at the very CE edge the wait expires. The VIP's READY gates every
+	// cycle: outside its own it stays low for a few clocks after a VIP write.
 	assign ready_o =
 		!mrq_i ? 1'b1 :
+		refresh_block_w ? 1'b0 :
 		(txn_start_w ?
-		 ((wait_count_start_r == WAIT_NONE) && (!wait_use_vip_r || vip_ready_i)) :
-		 ((wait_count_q == WAIT_NONE) && (!wait_use_vip_q || vip_ready_i)));
-	// Bit 37 held the retired external-memory helper flag; keep it reserved so
-	// the savestate layout is unchanged.
+		 ((wait_count_start_r == WAIT_NONE) && vip_ready_i) :
+		 ((wait_count_q == WAIT_NONE) && vip_ready_i));
+	// Bit 37 is reserved, keeping the savestate layout.
 	assign savestate_state_rdata_o = {
-		25'd0, wait_use_vip_q, 1'b0, wait_count_q,
+		10'd0, refresh_wait_q, refresh_left_q, refresh_due_q, 9'd0,
+		wait_use_vip_q, 1'b0, wait_count_q,
 		txn_rw_q, txn_da_q, txn_st_q, txn_be_q, txn_addr_q, txn_active_q};
+
+	always @(posedge clk_i or posedge reset_i) begin
+		if (reset_i) begin
+			refresh_due_q   <= 1'b0;
+			refresh_left_q  <= 4'd0;
+			refresh_wait_q  <= 1'b0;
+		end else if (savestate_state_wren_i) begin
+			refresh_due_q   <= savestate_state_wdata_i[48];
+			refresh_left_q  <= savestate_state_wdata_i[52:49];
+			refresh_wait_q  <= savestate_state_wdata_i[53];
+		end else if (ce_i) begin
+			if (refresh_tick_i) begin
+				refresh_due_q <= 1'b1;
+			end
+			if (refresh_left_q != 4'd0) begin
+				refresh_left_q <= refresh_left_q - 4'd1;
+			end else if (refresh_start_w) begin
+				refresh_left_q <= REFRESH_HOLD;
+				refresh_due_q  <= 1'b0;
+				refresh_wait_q <= 1'b0;
+			end else if (refresh_due_q) begin
+				refresh_wait_q <= 1'b1;
+			end
+		end
+	end
 
 	always @(posedge clk_i or posedge reset_i) begin
 		if (reset_i) begin
@@ -141,7 +190,7 @@ module vb_vue_wait_control
 			wait_count_q <= savestate_state_wdata_i[36:35];
 			wait_use_vip_q <= savestate_state_wdata_i[38];
 		end else if (ce_i) begin
-			if (!mrq_i) begin
+			if (!mrq_i || refresh_block_w) begin
 				txn_active_q     <= 1'b0;
 				wait_count_q     <= 2'd0;
 				wait_use_vip_q   <= 1'b0;
@@ -164,6 +213,7 @@ module vb_vue_wait_control
 
 endmodule
 
+// NVC timer, game pad, link port and WCR registers.
 module vb_vue_io
 (
 	input  wire        clk_i,
@@ -171,7 +221,6 @@ module vb_vue_io
 	input  wire        ce_i,
 
 	input  wire [15:0] pad_sample_i,
-	input  wire        rumble_enable_i,
 	input  wire        link_comcnt_i,
 	input  wire        link_clk_i,
 	input  wire        link_rx_i,
@@ -194,8 +243,10 @@ module vb_vue_io
 	output wire        link_clk_o,
 	output wire        link_tx_o,
 	output wire        link_sync_o,
-	output wire [15:0] rumble_o,
+	output wire        link_tx_done_o,
+	output wire [7:0]  link_tx_byte_o,
 
+	output wire        refresh_tick_o,    // The prescaler's 320-clock tick, to the WRAM refresh.
 	output wire        timer_tick_o,
 	output wire        timer_zero_o,
 	output wire        timer_irq_o,
@@ -204,43 +255,24 @@ module vb_vue_io
 	output wire        wait_exp1_o,
 	output wire        wait_rom1_o,
 	input  wire [4:0]  savestate_state_addr_i,
-	input  wire [63:0] savestate_state_wdata_i,
+	input  wire [50:0] savestate_state_wdata_i,
 	input  wire        savestate_state_wren_i,
 	output reg  [63:0] savestate_state_rdata_o
 );
 
-	localparam [8:0]  TIMER_DIV_20US_W = 9'd400;
-	localparam [1:0]  RUMBLE_FREQ_160HZ = 2'd0;
-	localparam [1:0]  RUMBLE_FREQ_240HZ = 2'd1;
-	localparam [1:0]  RUMBLE_FREQ_320HZ = 2'd2;
-	localparam [7:0]  RUMBLE_CMD_STOP = 8'h00;
-	localparam [7:0]  RUMBLE_CMD_PLAY = 8'h7c;
-	localparam [7:0]  RUMBLE_CMD_CHAIN_EFFECT_0 = 8'h80;
-	localparam [7:0]  RUMBLE_CMD_CHAIN_EFFECT_4 = 8'h84;
-	localparam [7:0]  RUMBLE_CMD_FREQ_160HZ = 8'h90;
-	localparam [7:0]  RUMBLE_CMD_FREQ_400HZ = 8'h93;
-	localparam [7:0]  RUMBLE_CMD_WRITE_EFFECT_CHAIN = 8'hb0;
-	localparam [7:0]  RUMBLE_CMD_WRITE_EFFECT_LOOPS_CHAIN = 8'hb1;
-	localparam [7:0]  RUMBLE_EFFECT_CHAIN_END = 8'hff;
-	localparam [2:0]  RUMBLE_WRITE_IDLE = 3'd0;
-	localparam [2:0]  RUMBLE_WRITE_EFFECT_CHAIN_SEL = 3'd1;
-	localparam [2:0]  RUMBLE_WRITE_EFFECT_BYTES = 3'd2;
-	localparam [2:0]  RUMBLE_WRITE_LOOP_CHAIN_SEL = 3'd3;
-	localparam [2:0]  RUMBLE_WRITE_LOOP_BYTES = 3'd4;
-	localparam [24:0] RUMBLE_WRITE_TIMEOUT_CYCLES = 25'd20000000;
-	localparam [27:0] RUMBLE_TICKS_35MS    = 28'd700000;
-	localparam [27:0] RUMBLE_TICKS_50MS    = 28'd1000000;
-	localparam [27:0] RUMBLE_TICKS_75MS    = 28'd1500000;
-	localparam [27:0] RUMBLE_TICKS_100MS   = 28'd2000000;
-	localparam [27:0] RUMBLE_TICKS_150MS   = 28'd3000000;
-	localparam [27:0] RUMBLE_TICKS_250MS   = 28'd5000000;
-	localparam [27:0] RUMBLE_TICKS_500MS   = 28'd10000000;
-	localparam [27:0] RUMBLE_TICKS_750MS   = 28'd15000000;
-	localparam [27:0] RUMBLE_TICKS_1000MS  = 28'd20000000;
-	localparam [27:0] RUMBLE_TICKS_10000MS = 28'd200000000;
-	localparam [13:0] PAD_READ_CYCLES_W  = 14'd10240;
-	localparam [8:0]  PAD_HALF_CYCLES_W  = 9'd320;
-	localparam [7:0]  COMM_HALF_CYCLES_W = 8'd200;
+	// One free-running prescaler from reset: a 40-clock stage, then /10 for the
+	// timer's 20 us tick, /8 for the WRAM refresh and the pad half-period, and /5
+	// for the link half-period. A read or transfer starts mid-period and runs on
+	// the shared ticks. The reset phases put the first refresh due 47 clocks after
+	// reset and the first 20 us tick 328 clocks after it.
+	localparam [5:0]  PRE40_RESET = 6'd33;
+	localparam [2:0]  PRE8_RESET  = 3'd6;
+	localparam [3:0]  PRE10_RESET = 4'd1;
+	reg [5:0]  pre40_q;
+	reg [2:0]  pre8_q;
+	reg [3:0]  pre10_q;
+	reg [2:0]  pre5_q;
+	reg        timer_base_q;     // The 20 us strobe, a clock after its prescaler tick.
 	reg        timer_clk_sel_q;
 	reg        timer_irq_en_q;
 	reg        timer_enabled_q;
@@ -248,7 +280,6 @@ module vb_vue_io
 	reg [15:0] timer_reload_q;
 	reg [15:0] timer_counter_q;
 	reg        timer_reload_pending_q;
-	reg [8:0]  timer_divider_q;
 	reg [2:0]  timer_subtick_q;
 	reg        timer_irq_q;
 
@@ -256,13 +287,12 @@ module vb_vue_io
 	reg        pad_para_si_q;
 	reg        pad_soft_ck_q;
 	reg        pad_abort_q;
-	reg [13:0] pad_busy_q;
+	reg        pad_busy_q;
 	reg        pad_irq_q;
 	reg [15:0] pad_data_q;
 	reg [15:0] pad_shift_q;
 	reg [15:0] pad_capture_q;
 	reg [4:0]  pad_shift_count_q;
-	reg [8:0]  pad_hw_divider_q;
 	reg [5:0]  pad_hw_edge_count_q;
 	reg        pad_hw_clock_q;
 	reg        pad_hw_latch_q;
@@ -271,7 +301,6 @@ module vb_vue_io
 	reg        comm_clk_sel_q;
 	reg        comm_busy_q;
 	reg [3:0]  comm_bit_count_q;
-	reg [7:0]  comm_half_divider_q;
 	reg        comm_clk_phase_q;
 	reg        link_clk_prev_q;
 	reg        comm_cc_int_inh_q;
@@ -287,34 +316,9 @@ module vb_vue_io
 	reg [7:0]  comm_rx_q;
 	reg [7:0]  comm_rx_shift_q;
 
-	reg [7:0]  rumble_chain_effect_q [0:39];
-	reg [2:0]  rumble_chain_loop_q [0:39];
-	reg [1:0]  rumble_freq_q;
-	reg [7:0]  rumble_last_effect_q;
-	reg [2:0]  rumble_last_chain_q;
-	reg        rumble_last_is_chain_q;
-	reg [2:0]  rumble_write_state_q;
-	reg [2:0]  rumble_write_chain_q;
-	reg [2:0]  rumble_write_slot_q;
-	reg [24:0] rumble_write_timeout_q;
-	reg        rumble_play_active_q;
-	reg        rumble_chain_active_q;
-	reg [2:0]  rumble_chain_play_q;
-	reg [2:0]  rumble_chain_slot_play_q;
-	reg [2:0]  rumble_chain_repeat_q;
-	reg [7:0]  rumble_effect_play_q;
-	reg [27:0] rumble_ticks_q;
-	reg [7:0]  rumble_large_q;
-	reg [7:0]  rumble_small_q;
-	reg        rumble_init_busy_q;
-	reg [5:0]  rumble_init_idx_q;
-
 	reg        wait_exp1_q;
 	reg        wait_rom1_q;
 	reg [7:0]  read8_bus_r;
-	integer    savestate_index_v;
-	wire [5:0] savestate_rumble_index_w =
-		{savestate_state_addr_i[2:0], 3'b000};
 	wire        bus_cycle_w = cs_i && mrq_i;
 	// Commit a register write only when the CPU accepts it with READY.
 	wire        bus_write_w = bus_cycle_w && da_i && !rw_i && ready_i;
@@ -326,8 +330,12 @@ module vb_vue_io
 	wire [5:0]  bus_addr_lo_w = {a_i[5:1], byte_hi_w};
 	wire [5:0]  half_addr_lo_w = {a_i[5:1], 1'b0};
 	wire [7:0]  write_byte_w = byte_hi_w ? din_i[15:8] : din_i[7:0];
-	wire        timer_base_tick_w =
-		(timer_divider_q == (TIMER_DIV_20US_W - 9'd1));
+	wire        pre_tick_w  = pre40_q == 6'd39;
+	wire        pre_320_w   = pre_tick_w && (pre8_q == 3'd7);
+	wire        pre_400_w   = pre_tick_w && (pre10_q == 4'd9);
+	wire        pre_200_w   = pre_tick_w && (pre5_q == 3'd4);
+	assign      refresh_tick_o = pre_320_w;
+	wire        timer_base_tick_w = timer_base_q;
 	wire        timer_counter_tick_w =
 		timer_base_tick_w && timer_enabled_q &&
 		(timer_clk_sel_q || (timer_subtick_q == 3'd4));
@@ -360,14 +368,17 @@ module vb_vue_io
 		((((byte_lo_w || byte_hi_w) && (bus_addr_lo_w == 6'h28)) && write_byte_w[0]) ||
 		 ((half_w && (half_addr_lo_w == 6'h28)) && din_i[0]));
 	wire        pad_abort_rise_w =
-		(pad_busy_q != 14'd0) &&
-		(pad_hw_divider_q == 9'd0) &&
+		pad_busy_q && pre_320_w &&
 		!pad_hw_latch_q && !pad_hw_clock_q &&
 		(pad_abort_q || pad_abort_write_set_w);
 
 	// STS: IRQ is high when bits 15:4 contain a press and bits 3:1 are clear.
 	wire        pad_irq_shift_match_w = (|pad_shift_q[15:4]) && (~|pad_shift_q[3:1]);
 	wire        comm_cc_rd_w = comm_cc_wr_q & link_comcnt_i;
+	// A link bit shifts on this edge; the eighth one ends the byte.
+	wire        comm_shift_w = comm_busy_q && (comm_clk_sel_q ?
+		(!link_clk_prev_q && link_clk_i) :
+		(pre_200_w && !comm_clk_phase_q));
 
 	always @(*) begin
 		read8_bus_r = 8'hff;
@@ -383,13 +394,538 @@ module vb_vue_io
 			6'h1c: read8_bus_r = timer_counter_q[15:8];
 			6'h20: read8_bus_r = {3'b111, timer_clk_sel_q, timer_irq_en_q, 1'b1, timer_zero_q, timer_enabled_q};
 			6'h24: read8_bus_r = {6'b111111, wait_exp1_q, wait_rom1_q};
-			6'h28: read8_bus_r = {pad_irq_en_n_q, 1'b1, pad_para_si_q, pad_soft_ck_q, 1'b1, 1'b1, (pad_busy_q != 14'd0), pad_abort_q};
+			6'h28: read8_bus_r = {pad_irq_en_n_q, 1'b1, pad_para_si_q, pad_soft_ck_q, 1'b1, 1'b1, pad_busy_q, pad_abort_q};
 			default: begin
 			end
 		endcase
 	end
 
-	// Effect amplitudes from the README percentages.
+	task comm_shift_bit_task;
+		input rx_bit;
+		reg [7:0] next_rx;
+		reg       next_cc_smp;
+		begin
+			next_rx = {comm_rx_shift_q[6:0], rx_bit};
+			next_cc_smp = 1'b0;
+			comm_tx_shift_q <= {comm_tx_shift_q[6:0], 1'b0};
+			comm_rx_shift_q <= next_rx;
+			comm_bit_count_q <= comm_bit_count_q - 4'd1;
+			if (comm_bit_count_q == 4'd1) begin
+				comm_busy_q      <= 1'b0;
+				comm_clk_phase_q <= 1'b1;
+				comm_rx_q        <= next_rx;
+				// STS: CC-Smp is both CC-Sig values ANDed with CC-Rd.
+				next_cc_smp      = comm_cc_sig_q & link_sync_i & comm_cc_rd_w;
+				comm_cc_smp_q    <= next_cc_smp;
+				if (!comm_irq_en_n_q) begin
+					comm_c_irq_q <= 1'b1;
+				end
+				if (!comm_cc_int_inh_q && (next_cc_smp == comm_cc_int_lev_q)) begin
+					comm_cc_irq_q <= 1'b1;
+				end
+			end
+		end
+	endtask
+
+	task write8_task;
+		input [5:0] addr;
+		input [7:0]  value;
+		reg   [15:0] next_timer_counter;
+		reg          timer_write_zero_hit;
+		reg          timer_zero_clear_hit;
+		begin
+			next_timer_counter  = 16'h0000;
+			timer_write_zero_hit = 1'b0;
+			timer_zero_clear_hit = 1'b0;
+			case (addr)
+				6'h00: begin
+					comm_irq_en_n_q <= value[7];
+					comm_clk_sel_q  <= value[4];
+					if (value[7]) begin
+						comm_c_irq_q <= 1'b0;
+					end
+					if (!comm_busy_q && value[2]) begin
+						comm_busy_q         <= 1'b1;
+						comm_bit_count_q    <= 4'd8;
+						comm_clk_phase_q    <= 1'b1;
+						comm_tx_latched_q   <= comm_tx_q;
+						comm_tx_shift_q     <= comm_tx_q;
+						comm_rx_shift_q     <= 8'h00;
+					end
+					if (comm_busy_q && comm_clk_sel_q && !value[4]) begin
+						comm_clk_phase_q    <= 1'b1;
+					end
+					if (comm_busy_q && !comm_clk_sel_q && value[4]) begin
+						comm_clk_phase_q <= 1'b1;
+					end
+				end
+				6'h04: begin
+					comm_cc_int_inh_q <= value[7];
+					comm_cc_int_lev_q <= value[4];
+					comm_cc_sig_q     <= value[3];
+					comm_cc_wr_q      <= value[1];
+					if (value[7]) begin
+						comm_cc_irq_q <= 1'b0;
+					end
+				end
+				6'h08: comm_tx_q <= value[7:0];
+				6'h18: begin
+					next_timer_counter = {timer_reload_q[15:8], value[7:0]};
+					timer_write_zero_hit =
+						(timer_counter_q != 16'h0000) &&
+						(next_timer_counter == 16'h0000);
+					timer_reload_q[7:0] <= value[7:0];
+					timer_counter_q     <= next_timer_counter;
+					// The 20 us divider keeps running across a preset. The
+					// first selected count loads the combined preset without
+					// decrementing it.
+					timer_reload_pending_q <= 1'b1;
+					if (timer_write_zero_hit) begin
+						if (timer_enabled_q) begin
+							timer_zero_q <= 1'b1;
+						end
+						if (timer_irq_en_q) begin
+							timer_irq_q <= 1'b1;
+						end
+					end
+				end
+				6'h1c: begin
+					next_timer_counter = {value[7:0], timer_reload_q[7:0]};
+					timer_write_zero_hit =
+						(timer_counter_q != 16'h0000) &&
+						(next_timer_counter == 16'h0000);
+					timer_reload_q[15:8] <= value[7:0];
+					timer_counter_q      <= next_timer_counter;
+					timer_reload_pending_q <= 1'b1;
+					if (timer_write_zero_hit) begin
+						if (timer_enabled_q) begin
+							timer_zero_q <= 1'b1;
+						end
+						if (timer_irq_en_q) begin
+							timer_irq_q <= 1'b1;
+						end
+					end
+				end
+				6'h20: begin
+					timer_clk_sel_q <= value[4];
+					timer_irq_en_q  <= value[3];
+					timer_enabled_q <= value[0];
+					if (timer_clk_sel_tick_w) begin
+						if (timer_reload_pending_q) begin
+							timer_counter_q <= timer_reload_q;
+							timer_reload_pending_q <= 1'b0;
+						end else if (timer_counter_q == 16'h0000) begin
+							timer_counter_q <= timer_reload_q;
+						end else begin
+							timer_counter_q <= timer_counter_q - 16'd1;
+							if (timer_counter_q == 16'h0001) begin
+								if (timer_enabled_q) begin
+									timer_zero_q <= 1'b1;
+								end
+								if (timer_irq_en_q) begin
+									timer_irq_q <= 1'b1;
+								end
+							end
+						end
+					end
+					timer_zero_clear_hit =
+						value[2] &&
+						(!timer_enabled_q || (value[0] && (timer_counter_q != 16'h0000))) &&
+						!timer_tick_zero_hit_w && !timer_clk_sel_zero_hit_w;
+					if (timer_zero_clear_hit) begin
+						timer_zero_q <= 1'b0;
+					end
+					if (!value[3] || timer_zero_clear_hit) begin
+						timer_irq_q <= 1'b0;
+					end
+				end
+				6'h24: begin
+					wait_exp1_q <= value[1];
+					wait_rom1_q <= value[0];
+				end
+				6'h28: begin
+					pad_irq_en_n_q <= value[7];
+					if (value[5]) begin
+						pad_para_si_q     <= 1'b1;
+						pad_shift_q       <= pad_sample_i;
+						pad_capture_q     <= 16'h0000;
+						pad_shift_count_q <= 5'd0;
+					end else begin
+						pad_para_si_q <= 1'b0;
+						if (pad_soft_ck_q && !value[4] && (pad_shift_count_q < 5'd16)) begin
+							pad_capture_q <= {pad_capture_q[14:0], pad_shift_q[15]};
+							pad_shift_q   <= {pad_shift_q[14:0], 1'b0};
+							if (pad_shift_count_q == 5'd15) begin
+								pad_data_q <= {pad_capture_q[14:0], pad_shift_q[15]};
+							end
+							pad_shift_count_q <= pad_shift_count_q + 5'd1;
+						end
+					end
+					pad_soft_ck_q <= value[4];
+					pad_abort_q   <= value[0];
+					if (value[2] && !value[0] && !pad_abort_q &&
+						!pad_busy_q) begin
+						pad_busy_q          <= 1'b1;
+						pad_shift_q         <= pad_sample_i;
+						pad_capture_q       <= 16'h0000;
+						pad_shift_count_q   <= 5'd0;
+						pad_hw_edge_count_q <= 6'd0;
+						pad_hw_clock_q      <= 1'b1;
+						pad_hw_latch_q      <= 1'b1;
+					end
+					if (value[7]) begin
+						pad_irq_q <= 1'b0;
+					end
+				end
+				default: begin
+				end
+			endcase
+		end
+	endtask
+
+	// I/O registers are 8-bit at four-byte stride. Mirror the defined byte
+	// above it. For halfword reads byte_hi_w is low, so read8_bus_r already
+	// holds the even-address register byte.
+	assign dout_o = half_w ?
+		{read8_bus_r, read8_bus_r} :
+		(bus_addr_lo_w[0] ? {read8_bus_r, 8'd0} : {8'd0, read8_bus_r});
+
+	// Timing pulses for work consumed on this enabled edge.
+	assign timer_tick_o = ce_i && !reset_i &&
+		(timer_counter_tick_w || timer_clk_sel_tick_w);
+	assign timer_zero_o = ce_i && !reset_i &&
+		(timer_tick_zero_hit_w || timer_clk_sel_zero_hit_w);
+	assign timer_irq_o = timer_irq_q;
+	assign pad_irq_o   = pad_irq_q;
+	assign comm_irq_o  = comm_c_irq_q | comm_cc_irq_q;
+	assign wait_exp1_o = wait_exp1_q;
+	assign wait_rom1_o = wait_rom1_q;
+	assign pad_latch_o = pad_busy_q ? pad_hw_latch_q : pad_para_si_q;
+	assign pad_clock_o = pad_busy_q ? pad_hw_clock_q : ~pad_soft_ck_q;
+	assign link_comcnt_o = comm_cc_wr_q;
+	assign link_clk_o    = (!comm_clk_sel_q && comm_busy_q) ? comm_clk_phase_q : 1'b1;
+	assign link_tx_o     = comm_busy_q ? comm_tx_shift_q[7] : 1'b0;
+	assign link_sync_o   = comm_cc_sig_q;
+	assign link_tx_done_o = ce_i && !reset_i && comm_shift_w && (comm_bit_count_q == 4'd1);
+	assign link_tx_byte_o = comm_tx_latched_q;
+
+	always @* begin
+		savestate_state_rdata_o = 64'd0;
+		case (savestate_state_addr_i)
+			5'd0: savestate_state_rdata_o = {
+				14'd0, timer_reload_pending_q, timer_irq_q,
+				timer_subtick_q, pre8_q, pre40_q,
+				timer_counter_q, timer_reload_q, timer_zero_q,
+				timer_enabled_q, timer_irq_en_q, timer_clk_sel_q};
+			5'd1: savestate_state_rdata_o = {
+				13'd0, pad_shift_q, pad_data_q, pad_irq_q, 13'd0, pad_busy_q,
+				pad_abort_q, pad_soft_ck_q, pad_para_si_q, pad_irq_en_n_q};
+			5'd2: savestate_state_rdata_o = {
+				26'd0, pad_hw_latch_q, pad_hw_clock_q, pad_hw_edge_count_q,
+				1'b0, timer_base_q, pre5_q, pre10_q, pad_shift_count_q, pad_capture_q};
+			5'd3: savestate_state_rdata_o = {
+				16'd0, comm_irq_en_n_q, comm_clk_sel_q, comm_busy_q,
+				comm_bit_count_q, 8'd0, comm_clk_phase_q,
+				link_clk_prev_q, comm_cc_int_inh_q, comm_cc_int_lev_q,
+				comm_cc_sig_q, comm_cc_smp_q, comm_cc_wr_q,
+				comm_c_irq_q, comm_cc_irq_q, comm_tx_q,
+				comm_tx_latched_q, comm_tx_shift_q};
+			5'd4: savestate_state_rdata_o = {
+				48'd0, comm_rx_q, comm_rx_shift_q};
+			5'd7: savestate_state_rdata_o = {62'd0, wait_exp1_q, wait_rom1_q};
+			default: begin
+			end
+		endcase
+	end
+
+	always @(posedge clk_i or posedge reset_i) begin
+		if (reset_i) begin
+			timer_clk_sel_q   <= 1'b0;
+			timer_irq_en_q    <= 1'b0;
+			timer_enabled_q   <= 1'b0;
+			timer_zero_q      <= 1'b0;
+			timer_reload_q    <= 16'hffff;
+			timer_counter_q   <= 16'hffff;
+			timer_reload_pending_q <= 1'b0;
+			pre40_q           <= PRE40_RESET;
+			pre8_q            <= PRE8_RESET;
+			pre10_q           <= PRE10_RESET;
+			pre5_q            <= 3'd0;
+			timer_base_q      <= 1'b0;
+			timer_subtick_q   <= 3'd0;
+			timer_irq_q       <= 1'b0;
+
+			pad_irq_en_n_q    <= 1'b0;
+			pad_para_si_q     <= 1'b0;
+			pad_soft_ck_q     <= 1'b0;
+			pad_abort_q       <= 1'b0;
+			pad_busy_q        <= 1'b0;
+			pad_irq_q         <= 1'b0;
+			pad_data_q        <= 16'h0000;
+			pad_shift_q       <= 16'h0000;
+			pad_capture_q     <= 16'h0000;
+			pad_shift_count_q <= 5'd0;
+			pad_hw_edge_count_q <= 6'd0;
+			pad_hw_clock_q    <= 1'b1;
+			pad_hw_latch_q    <= 1'b0;
+
+			comm_irq_en_n_q   <= 1'b0;
+			comm_clk_sel_q    <= 1'b0;
+			comm_busy_q       <= 1'b0;
+			comm_bit_count_q  <= 4'd0;
+			comm_clk_phase_q  <= 1'b1;
+			link_clk_prev_q   <= 1'b1;
+			comm_cc_int_inh_q <= 1'b1;
+			comm_cc_int_lev_q <= 1'b1;
+			comm_cc_sig_q     <= 1'b1;
+			comm_cc_smp_q     <= 1'b1;
+			comm_cc_wr_q      <= 1'b1;
+			comm_c_irq_q      <= 1'b0;
+			comm_cc_irq_q     <= 1'b0;
+			comm_tx_q         <= 8'h00;
+			comm_tx_latched_q <= 8'h00;
+			comm_tx_shift_q   <= 8'h00;
+			comm_rx_q         <= 8'h00;
+			comm_rx_shift_q   <= 8'h00;
+
+			wait_exp1_q       <= 1'b0;
+			wait_rom1_q       <= 1'b0;
+		end else if (savestate_state_wren_i) begin
+			case (savestate_state_addr_i)
+				5'd0: begin
+					timer_clk_sel_q <= savestate_state_wdata_i[0];
+					timer_irq_en_q <= savestate_state_wdata_i[1];
+					timer_enabled_q <= savestate_state_wdata_i[2];
+					timer_zero_q <= savestate_state_wdata_i[3];
+					timer_reload_q <= savestate_state_wdata_i[19:4];
+					timer_counter_q <= savestate_state_wdata_i[35:20];
+					pre40_q <= savestate_state_wdata_i[41:36];
+					pre8_q <= savestate_state_wdata_i[44:42];
+					timer_subtick_q <= savestate_state_wdata_i[47:45];
+					timer_irq_q <= savestate_state_wdata_i[48];
+					timer_reload_pending_q <= savestate_state_wdata_i[49];
+				end
+				5'd1: begin
+					pad_irq_en_n_q <= savestate_state_wdata_i[0];
+					pad_para_si_q <= savestate_state_wdata_i[1];
+					pad_soft_ck_q <= savestate_state_wdata_i[2];
+					pad_abort_q <= savestate_state_wdata_i[3];
+					pad_busy_q <= |savestate_state_wdata_i[17:4];
+					pad_irq_q <= savestate_state_wdata_i[18];
+					pad_data_q <= savestate_state_wdata_i[34:19];
+					pad_shift_q <= savestate_state_wdata_i[50:35];
+				end
+				5'd2: begin
+					pad_capture_q <= savestate_state_wdata_i[15:0];
+					pad_shift_count_q <= savestate_state_wdata_i[20:16];
+					pre10_q <= savestate_state_wdata_i[24:21];
+					pre5_q <= savestate_state_wdata_i[27:25];
+					timer_base_q <= savestate_state_wdata_i[28];
+					pad_hw_edge_count_q <= savestate_state_wdata_i[35:30];
+					pad_hw_clock_q <= savestate_state_wdata_i[36];
+					pad_hw_latch_q <= savestate_state_wdata_i[37];
+				end
+				5'd3: begin
+					comm_tx_shift_q <= savestate_state_wdata_i[7:0];
+					comm_tx_latched_q <= savestate_state_wdata_i[15:8];
+					comm_tx_q <= savestate_state_wdata_i[23:16];
+					comm_cc_irq_q <= savestate_state_wdata_i[24];
+					comm_c_irq_q <= savestate_state_wdata_i[25];
+					comm_cc_wr_q <= savestate_state_wdata_i[26];
+					comm_cc_smp_q <= savestate_state_wdata_i[27];
+					comm_cc_sig_q <= savestate_state_wdata_i[28];
+					comm_cc_int_lev_q <= savestate_state_wdata_i[29];
+					comm_cc_int_inh_q <= savestate_state_wdata_i[30];
+					link_clk_prev_q <= savestate_state_wdata_i[31];
+					comm_clk_phase_q <= savestate_state_wdata_i[32];
+					comm_bit_count_q <= savestate_state_wdata_i[44:41];
+					comm_busy_q <= savestate_state_wdata_i[45];
+					comm_clk_sel_q <= savestate_state_wdata_i[46];
+					comm_irq_en_n_q <= savestate_state_wdata_i[47];
+				end
+				5'd4: begin
+					comm_rx_shift_q <= savestate_state_wdata_i[7:0];
+					comm_rx_q <= savestate_state_wdata_i[15:8];
+				end
+				5'd7: begin
+					wait_rom1_q <= savestate_state_wdata_i[0];
+					wait_exp1_q <= savestate_state_wdata_i[1];
+				end
+				default: begin
+				end
+			endcase
+		end else if (ce_i) begin
+			pre40_q      <= pre_tick_w ? 6'd0 : pre40_q + 6'd1;
+			timer_base_q <= pre_400_w;
+			if (pre_tick_w) begin
+				pre8_q  <= pre8_q + 3'd1;
+				pre10_q <= (pre10_q == 4'd9) ? 4'd0 : pre10_q + 4'd1;
+				pre5_q  <= (pre5_q == 3'd4) ? 3'd0 : pre5_q + 3'd1;
+			end
+
+			if (timer_base_tick_w) begin
+				// The 100 us stage counts only while 100 us is selected, so
+				// switching back to 20 us counts a tick only if one passed.
+				if (timer_clk_sel_q || (timer_subtick_q == 3'd4)) begin
+					timer_subtick_q <= 3'd0;
+				end else begin
+					timer_subtick_q <= timer_subtick_q + 3'd1;
+				end
+
+				if (timer_counter_tick_w) begin
+					if (timer_reload_pending_q) begin
+						timer_counter_q <= timer_reload_q;
+						timer_reload_pending_q <= 1'b0;
+					end else if (timer_counter_q == 16'h0000) begin
+						timer_counter_q <= timer_reload_q;
+					end else begin
+						timer_counter_q <= timer_counter_q - 16'd1;
+						if (timer_counter_q == 16'h0001) begin
+							timer_zero_q <= 1'b1;
+							if (timer_irq_en_q) begin
+								timer_irq_q <= 1'b1;
+							end
+						end
+					end
+				end
+			end
+
+			if (pad_busy_q) begin
+				if (pad_abort_rise_w) begin
+					// Suspend only on the rising serial clock, without committing data or IRQ.
+					pad_busy_q          <= 1'b0;
+					pad_hw_edge_count_q <= 6'd0;
+					pad_hw_clock_q      <= 1'b1;
+					pad_hw_latch_q      <= 1'b0;
+				end else begin
+					if (pre_320_w) begin
+						if (pad_hw_latch_q) begin
+							// Latch the parallel input before the sixteen serial clocks.
+							if (pad_hw_edge_count_q == 6'd0) begin
+								pad_hw_edge_count_q <= 6'd1;
+							end else begin
+								pad_hw_latch_q      <= 1'b0;
+								pad_hw_edge_count_q <= 6'd0;
+							end
+						end else begin
+							pad_hw_clock_q <= ~pad_hw_clock_q;
+							if (pad_hw_edge_count_q != 6'd31) begin
+								pad_hw_edge_count_q <= pad_hw_edge_count_q + 6'd1;
+							end else begin
+								// The sixteenth bit is in: the read ends.
+								pad_busy_q <= 1'b0;
+								pad_data_q <= pad_shift_q;
+								// Key IRQ needs a new press in 15:4 with bits 3:1 clear.
+								if (!pad_irq_en_n_q && pad_irq_shift_match_w) begin
+									pad_irq_q <= 1'b1;
+								end
+							end
+						end
+					end
+				end
+			end
+
+			link_clk_prev_q <= link_clk_i;
+
+			if (comm_busy_q) begin
+				if (comm_clk_sel_q) begin
+					if (!link_clk_prev_q && link_clk_i) begin
+						comm_shift_bit_task(link_rx_i);
+					end
+				end else if (pre_200_w) begin
+					comm_clk_phase_q    <= ~comm_clk_phase_q;
+					if (!comm_clk_phase_q) begin
+						comm_shift_bit_task(link_rx_i);
+					end
+				end
+			end
+
+			if (bus_write_w && (byte_lo_w || byte_hi_w)) begin
+				write8_task(bus_addr_lo_w, write_byte_w);
+			end else if (bus_write_w && half_w) begin
+				write8_task(half_addr_lo_w + 6'd0, din_i[7:0]);
+				write8_task(half_addr_lo_w + 6'd1, din_i[15:8]);
+			end
+		end
+	end
+
+endmodule
+
+// Rumble accessory on the link port. It acts on each byte the link port
+// sends and drives the two motor levels.
+module vb_rumble_pak
+(
+	input  wire        clk_i,
+	input  wire        reset_i,
+	input  wire        ce_i,
+
+	input  wire        enable_i,
+	input  wire        byte_valid_i,
+	input  wire [7:0]  byte_i,
+	output wire [15:0] rumble_o,
+
+	// VUE I/O savestate window rows; row 7 also holds WCR, read as zero here.
+	input  wire [4:0]  savestate_state_addr_i,
+	input  wire [63:0] savestate_state_wdata_i,
+	input  wire        savestate_state_wren_i,
+	output reg  [63:0] savestate_state_rdata_o
+);
+
+	localparam [1:0]  RUMBLE_FREQ_160HZ = 2'd0;
+	localparam [1:0]  RUMBLE_FREQ_240HZ = 2'd1;
+	localparam [1:0]  RUMBLE_FREQ_320HZ = 2'd2;
+	localparam [7:0]  RUMBLE_CMD_STOP = 8'h00;
+	localparam [7:0]  RUMBLE_CMD_PLAY = 8'h7c;
+	localparam [7:0]  RUMBLE_CMD_CHAIN_EFFECT_0 = 8'h80;
+	localparam [7:0]  RUMBLE_CMD_CHAIN_EFFECT_4 = 8'h84;
+	localparam [7:0]  RUMBLE_CMD_FREQ_160HZ = 8'h90;
+	localparam [7:0]  RUMBLE_CMD_FREQ_400HZ = 8'h93;
+	localparam [7:0]  RUMBLE_CMD_WRITE_EFFECT_CHAIN = 8'hb0;
+	localparam [7:0]  RUMBLE_CMD_WRITE_EFFECT_LOOPS_CHAIN = 8'hb1;
+	localparam [7:0]  RUMBLE_EFFECT_CHAIN_END = 8'hff;
+	localparam [2:0]  RUMBLE_WRITE_IDLE = 3'd0;
+	localparam [2:0]  RUMBLE_WRITE_EFFECT_CHAIN_SEL = 3'd1;
+	localparam [2:0]  RUMBLE_WRITE_EFFECT_BYTES = 3'd2;
+	localparam [2:0]  RUMBLE_WRITE_LOOP_CHAIN_SEL = 3'd3;
+	localparam [2:0]  RUMBLE_WRITE_LOOP_BYTES = 3'd4;
+	localparam [24:0] RUMBLE_WRITE_TIMEOUT_CYCLES = 25'd20000000;
+	localparam [27:0] RUMBLE_TICKS_35MS    = 28'd700000;
+	localparam [27:0] RUMBLE_TICKS_50MS    = 28'd1000000;
+	localparam [27:0] RUMBLE_TICKS_75MS    = 28'd1500000;
+	localparam [27:0] RUMBLE_TICKS_100MS   = 28'd2000000;
+	localparam [27:0] RUMBLE_TICKS_150MS   = 28'd3000000;
+	localparam [27:0] RUMBLE_TICKS_250MS   = 28'd5000000;
+	localparam [27:0] RUMBLE_TICKS_500MS   = 28'd10000000;
+	localparam [27:0] RUMBLE_TICKS_750MS   = 28'd15000000;
+	localparam [27:0] RUMBLE_TICKS_1000MS  = 28'd20000000;
+	localparam [27:0] RUMBLE_TICKS_10000MS = 28'd200000000;
+
+	reg [7:0]  rumble_chain_effect_q [0:39];
+	reg [2:0]  rumble_chain_loop_q [0:39];
+	reg [1:0]  rumble_freq_q;
+	reg [7:0]  rumble_last_effect_q;
+	reg [2:0]  rumble_last_chain_q;
+	reg        rumble_last_is_chain_q;
+	reg [2:0]  rumble_write_state_q;
+	reg [2:0]  rumble_write_chain_q;
+	reg [2:0]  rumble_write_slot_q;
+	reg [24:0] rumble_write_timeout_q;
+	reg        rumble_play_active_q;
+	reg        rumble_chain_active_q;
+	reg [2:0]  rumble_chain_play_q;
+	reg [2:0]  rumble_chain_slot_play_q;
+	reg [2:0]  rumble_chain_repeat_q;
+	reg [7:0]  rumble_effect_play_q;
+	reg [27:0] rumble_ticks_q;
+	reg [7:0]  rumble_large_q;
+	reg [7:0]  rumble_small_q;
+	reg        rumble_init_busy_q;
+	reg [5:0]  rumble_init_idx_q;
+	integer    savestate_index_v;
+	wire [5:0] savestate_rumble_index_w =
+		{savestate_state_addr_i[2:0], 3'b000};
+
+	// Effect amplitudes:
 	// 100%=0xff, 80%=0xcc, 60%=0x99, 50%=0x80, 40%=0x66, 30%=0x4d, 20%=0x33, 10%=0x1a.
 	// Effects 70-117 use a fixed 50% approximation of their ramps.
 	function [7:0] rumble_effect_level_fn;
@@ -635,246 +1171,12 @@ module vb_vue_io
 		end
 	endtask
 
-	task comm_shift_bit_task;
-		input rx_bit;
-		reg [7:0] next_rx;
-		reg       next_cc_smp;
-		begin
-			next_rx = {comm_rx_shift_q[6:0], rx_bit};
-			next_cc_smp = 1'b0;
-			comm_tx_shift_q <= {comm_tx_shift_q[6:0], 1'b0};
-			comm_rx_shift_q <= next_rx;
-			comm_bit_count_q <= comm_bit_count_q - 4'd1;
-			if (comm_bit_count_q == 4'd1) begin
-				comm_busy_q      <= 1'b0;
-				comm_clk_phase_q <= 1'b1;
-				comm_rx_q        <= next_rx;
-				// STS: CC-Smp is both CC-Sig values ANDed with CC-Rd.
-				next_cc_smp      = comm_cc_sig_q & link_sync_i & comm_cc_rd_w;
-				comm_cc_smp_q    <= next_cc_smp;
-				if (!comm_irq_en_n_q) begin
-					comm_c_irq_q <= 1'b1;
-				end
-				if (!comm_cc_int_inh_q && (next_cc_smp == comm_cc_int_lev_q)) begin
-					comm_cc_irq_q <= 1'b1;
-				end
-				// Send CDTR to the accessory after all eight bits.
-				if (rumble_enable_i && !rumble_init_busy_q) begin
-					rumble_receive_byte_task(comm_tx_latched_q);
-				end
-			end
-		end
-	endtask
-
-	task write8_task;
-		input [5:0] addr;
-		input [7:0]  value;
-		reg   [15:0] next_timer_counter;
-		reg          timer_write_zero_hit;
-		reg          timer_zero_clear_hit;
-		begin
-			next_timer_counter  = 16'h0000;
-			timer_write_zero_hit = 1'b0;
-			timer_zero_clear_hit = 1'b0;
-			case (addr)
-				6'h00: begin
-					comm_irq_en_n_q <= value[7];
-					comm_clk_sel_q  <= value[4];
-					if (value[7]) begin
-						comm_c_irq_q <= 1'b0;
-					end
-					if (!comm_busy_q && value[2]) begin
-						comm_busy_q         <= 1'b1;
-						comm_bit_count_q    <= 4'd8;
-						comm_half_divider_q <= COMM_HALF_CYCLES_W - 8'd1;
-						comm_clk_phase_q    <= 1'b1;
-						comm_tx_latched_q   <= comm_tx_q;
-						comm_tx_shift_q     <= comm_tx_q;
-						comm_rx_shift_q     <= 8'h00;
-					end
-					if (comm_busy_q && comm_clk_sel_q && !value[4]) begin
-						comm_half_divider_q <= COMM_HALF_CYCLES_W - 8'd1;
-						comm_clk_phase_q    <= 1'b1;
-					end
-					if (comm_busy_q && !comm_clk_sel_q && value[4]) begin
-						comm_clk_phase_q <= 1'b1;
-					end
-				end
-				6'h04: begin
-					comm_cc_int_inh_q <= value[7];
-					comm_cc_int_lev_q <= value[4];
-					comm_cc_sig_q     <= value[3];
-					comm_cc_wr_q      <= value[1];
-					if (value[7]) begin
-						comm_cc_irq_q <= 1'b0;
-					end
-				end
-				6'h08: comm_tx_q <= value[7:0];
-				6'h18: begin
-					next_timer_counter = {timer_reload_q[15:8], value[7:0]};
-					timer_write_zero_hit =
-						(timer_counter_q != 16'h0000) &&
-						(next_timer_counter == 16'h0000);
-					timer_reload_q[7:0] <= value[7:0];
-					timer_counter_q     <= next_timer_counter;
-					// Physical-v8 IRQ phase sweeps show that the 20 us
-					// divider remains free-running across a preset. The first
-					// selected count loads the combined preset without
-					// decrementing it.
-					timer_reload_pending_q <= 1'b1;
-					if (timer_write_zero_hit) begin
-						if (timer_enabled_q) begin
-							timer_zero_q <= 1'b1;
-						end
-						if (timer_irq_en_q) begin
-							timer_irq_q <= 1'b1;
-						end
-					end
-				end
-				6'h1c: begin
-					next_timer_counter = {value[7:0], timer_reload_q[7:0]};
-					timer_write_zero_hit =
-						(timer_counter_q != 16'h0000) &&
-						(next_timer_counter == 16'h0000);
-					timer_reload_q[15:8] <= value[7:0];
-					timer_counter_q      <= next_timer_counter;
-					timer_reload_pending_q <= 1'b1;
-					if (timer_write_zero_hit) begin
-						if (timer_enabled_q) begin
-							timer_zero_q <= 1'b1;
-						end
-						if (timer_irq_en_q) begin
-							timer_irq_q <= 1'b1;
-						end
-					end
-				end
-				6'h20: begin
-					timer_clk_sel_q <= value[4];
-					timer_irq_en_q  <= value[3];
-					timer_enabled_q <= value[0];
-					if (timer_clk_sel_tick_w) begin
-						if (timer_reload_pending_q) begin
-							timer_counter_q <= timer_reload_q;
-							timer_reload_pending_q <= 1'b0;
-						end else if (timer_counter_q == 16'h0000) begin
-							timer_counter_q <= timer_reload_q;
-						end else begin
-							timer_counter_q <= timer_counter_q - 16'd1;
-							if (timer_counter_q == 16'h0001) begin
-								if (timer_enabled_q) begin
-									timer_zero_q <= 1'b1;
-								end
-								if (timer_irq_en_q) begin
-									timer_irq_q <= 1'b1;
-								end
-							end
-						end
-					end
-					timer_zero_clear_hit =
-						value[2] &&
-						(!timer_enabled_q || (value[0] && (timer_counter_q != 16'h0000))) &&
-						!timer_tick_zero_hit_w && !timer_clk_sel_zero_hit_w;
-					if (timer_zero_clear_hit) begin
-						timer_zero_q <= 1'b0;
-					end
-					if (!value[3] || timer_zero_clear_hit) begin
-						timer_irq_q <= 1'b0;
-					end
-				end
-				6'h24: begin
-					wait_exp1_q <= value[1];
-					wait_rom1_q <= value[0];
-				end
-				6'h28: begin
-					pad_irq_en_n_q <= value[7];
-					if (value[5]) begin
-						pad_para_si_q     <= 1'b1;
-						pad_shift_q       <= pad_sample_i;
-						pad_capture_q     <= 16'h0000;
-						pad_shift_count_q <= 5'd0;
-					end else begin
-						pad_para_si_q <= 1'b0;
-						if (pad_soft_ck_q && !value[4] && (pad_shift_count_q < 5'd16)) begin
-							pad_capture_q <= {pad_capture_q[14:0], pad_shift_q[15]};
-							pad_shift_q   <= {pad_shift_q[14:0], 1'b0};
-							if (pad_shift_count_q == 5'd15) begin
-								pad_data_q <= {pad_capture_q[14:0], pad_shift_q[15]};
-							end
-							pad_shift_count_q <= pad_shift_count_q + 5'd1;
-						end
-					end
-					pad_soft_ck_q <= value[4];
-					pad_abort_q   <= value[0];
-					if (value[2] && !value[0] && !pad_abort_q &&
-						(pad_busy_q == 14'd0)) begin
-						pad_busy_q          <= PAD_READ_CYCLES_W;
-						pad_shift_q         <= pad_sample_i;
-						pad_capture_q       <= 16'h0000;
-						pad_shift_count_q   <= 5'd0;
-						pad_hw_divider_q    <= PAD_HALF_CYCLES_W - 9'd1;
-						pad_hw_edge_count_q <= 6'd0;
-						pad_hw_clock_q      <= 1'b1;
-						pad_hw_latch_q      <= 1'b1;
-					end
-					if (value[7]) begin
-						pad_irq_q <= 1'b0;
-					end
-				end
-				default: begin
-				end
-			endcase
-		end
-	endtask
-
-	// I/O registers are 8-bit at four-byte stride. Mirror the defined byte
-	// above it. For halfword reads byte_hi_w is low, so read8_bus_r already
-	// holds the even-address register byte.
-	assign dout_o = half_w ?
-		{read8_bus_r, read8_bus_r} :
-		(bus_addr_lo_w[0] ? {read8_bus_r, 8'd0} : {8'd0, read8_bus_r});
-
-	// Timing pulses for work consumed on this enabled edge.
-	assign timer_tick_o = ce_i && !reset_i &&
-		(timer_counter_tick_w || timer_clk_sel_tick_w);
-	assign timer_zero_o = ce_i && !reset_i &&
-		(timer_tick_zero_hit_w || timer_clk_sel_zero_hit_w);
-	assign timer_irq_o = timer_irq_q;
-	assign pad_irq_o   = pad_irq_q;
-	assign comm_irq_o  = comm_c_irq_q | comm_cc_irq_q;
-	assign wait_exp1_o = wait_exp1_q;
-	assign wait_rom1_o = wait_rom1_q;
-	assign pad_latch_o = (pad_busy_q != 14'd0) ? pad_hw_latch_q : pad_para_si_q;
-	assign pad_clock_o = (pad_busy_q != 14'd0) ? pad_hw_clock_q : ~pad_soft_ck_q;
-	assign link_comcnt_o = comm_cc_wr_q;
-	assign link_clk_o    = (!comm_clk_sel_q && comm_busy_q) ? comm_clk_phase_q : 1'b1;
-	assign link_tx_o     = comm_busy_q ? comm_tx_shift_q[7] : 1'b0;
-	assign link_sync_o   = comm_cc_sig_q;
-	assign rumble_o      = rumble_enable_i ?
+	assign rumble_o = enable_i ?
 		{rumble_large_q, rumble_small_q} : 16'd0;
 
 	always @* begin
 		savestate_state_rdata_o = 64'd0;
 		case (savestate_state_addr_i)
-			5'd0: savestate_state_rdata_o = {
-				14'd0, timer_reload_pending_q, timer_irq_q,
-				timer_subtick_q, timer_divider_q,
-				timer_counter_q, timer_reload_q, timer_zero_q,
-				timer_enabled_q, timer_irq_en_q, timer_clk_sel_q};
-			5'd1: savestate_state_rdata_o = {
-				13'd0, pad_shift_q, pad_data_q, pad_irq_q, pad_busy_q,
-				pad_abort_q, pad_soft_ck_q, pad_para_si_q, pad_irq_en_n_q};
-			5'd2: savestate_state_rdata_o = {
-				26'd0, pad_hw_latch_q, pad_hw_clock_q, pad_hw_edge_count_q,
-				pad_hw_divider_q, pad_shift_count_q, pad_capture_q};
-			5'd3: savestate_state_rdata_o = {
-				16'd0, comm_irq_en_n_q, comm_clk_sel_q, comm_busy_q,
-				comm_bit_count_q, comm_half_divider_q, comm_clk_phase_q,
-				link_clk_prev_q, comm_cc_int_inh_q, comm_cc_int_lev_q,
-				comm_cc_sig_q, comm_cc_smp_q, comm_cc_wr_q,
-				comm_c_irq_q, comm_cc_irq_q, comm_tx_q,
-				comm_tx_latched_q, comm_tx_shift_q};
-			5'd4: savestate_state_rdata_o = {
-				48'd0, comm_rx_q, comm_rx_shift_q};
 			5'd5: savestate_state_rdata_o = {
 				16'd0, rumble_write_timeout_q, rumble_write_slot_q,
 				rumble_write_chain_q, rumble_write_state_q,
@@ -886,7 +1188,7 @@ module vb_vue_io
 				rumble_chain_repeat_q, rumble_effect_play_q, rumble_ticks_q};
 			5'd7: savestate_state_rdata_o = {
 				39'd0, rumble_large_q, rumble_small_q, rumble_init_busy_q,
-				rumble_init_idx_q, wait_exp1_q, wait_rom1_q};
+				rumble_init_idx_q, 2'b00};
 			5'd8, 5'd9, 5'd10, 5'd11, 5'd12:
 				savestate_state_rdata_o = {
 					rumble_chain_effect_q[savestate_rumble_index_w + 6'd7],
@@ -915,52 +1217,6 @@ module vb_vue_io
 
 	always @(posedge clk_i or posedge reset_i) begin
 		if (reset_i) begin
-			timer_clk_sel_q   <= 1'b0;
-			timer_irq_en_q    <= 1'b0;
-			timer_enabled_q   <= 1'b0;
-			timer_zero_q      <= 1'b0;
-			timer_reload_q    <= 16'hffff;
-			timer_counter_q   <= 16'hffff;
-			timer_reload_pending_q <= 1'b0;
-			timer_divider_q   <= 9'd0;
-			timer_subtick_q   <= 3'd0;
-			timer_irq_q       <= 1'b0;
-
-			pad_irq_en_n_q    <= 1'b0;
-			pad_para_si_q     <= 1'b0;
-			pad_soft_ck_q     <= 1'b0;
-			pad_abort_q       <= 1'b0;
-			pad_busy_q        <= 14'd0;
-			pad_irq_q         <= 1'b0;
-			pad_data_q        <= 16'h0000;
-			pad_shift_q       <= 16'h0000;
-			pad_capture_q     <= 16'h0000;
-			pad_shift_count_q <= 5'd0;
-			pad_hw_divider_q  <= 9'd0;
-			pad_hw_edge_count_q <= 6'd0;
-			pad_hw_clock_q    <= 1'b1;
-			pad_hw_latch_q    <= 1'b0;
-
-			comm_irq_en_n_q   <= 1'b0;
-			comm_clk_sel_q    <= 1'b0;
-			comm_busy_q       <= 1'b0;
-			comm_bit_count_q  <= 4'd0;
-			comm_half_divider_q <= 8'd0;
-			comm_clk_phase_q  <= 1'b1;
-			link_clk_prev_q   <= 1'b1;
-			comm_cc_int_inh_q <= 1'b1;
-			comm_cc_int_lev_q <= 1'b1;
-			comm_cc_sig_q     <= 1'b1;
-			comm_cc_smp_q     <= 1'b1;
-			comm_cc_wr_q      <= 1'b1;
-			comm_c_irq_q      <= 1'b0;
-			comm_cc_irq_q     <= 1'b0;
-			comm_tx_q         <= 8'h00;
-			comm_tx_latched_q <= 8'h00;
-			comm_tx_shift_q   <= 8'h00;
-			comm_rx_q         <= 8'h00;
-			comm_rx_shift_q   <= 8'h00;
-
 			rumble_freq_q <= RUMBLE_FREQ_160HZ;
 			rumble_last_effect_q <= 8'h00;
 			rumble_last_chain_q <= 3'd0;
@@ -980,64 +1236,8 @@ module vb_vue_io
 			rumble_small_q <= 8'd0;
 			rumble_init_busy_q <= 1'b1;
 			rumble_init_idx_q <= 6'd0;
-
-			wait_exp1_q       <= 1'b0;
-			wait_rom1_q       <= 1'b0;
 		end else if (savestate_state_wren_i) begin
 			case (savestate_state_addr_i)
-				5'd0: begin
-					timer_clk_sel_q <= savestate_state_wdata_i[0];
-					timer_irq_en_q <= savestate_state_wdata_i[1];
-					timer_enabled_q <= savestate_state_wdata_i[2];
-					timer_zero_q <= savestate_state_wdata_i[3];
-					timer_reload_q <= savestate_state_wdata_i[19:4];
-					timer_counter_q <= savestate_state_wdata_i[35:20];
-					timer_divider_q <= savestate_state_wdata_i[44:36];
-					timer_subtick_q <= savestate_state_wdata_i[47:45];
-					timer_irq_q <= savestate_state_wdata_i[48];
-					timer_reload_pending_q <= savestate_state_wdata_i[49];
-				end
-				5'd1: begin
-					pad_irq_en_n_q <= savestate_state_wdata_i[0];
-					pad_para_si_q <= savestate_state_wdata_i[1];
-					pad_soft_ck_q <= savestate_state_wdata_i[2];
-					pad_abort_q <= savestate_state_wdata_i[3];
-					pad_busy_q <= savestate_state_wdata_i[17:4];
-					pad_irq_q <= savestate_state_wdata_i[18];
-					pad_data_q <= savestate_state_wdata_i[34:19];
-					pad_shift_q <= savestate_state_wdata_i[50:35];
-				end
-				5'd2: begin
-					pad_capture_q <= savestate_state_wdata_i[15:0];
-					pad_shift_count_q <= savestate_state_wdata_i[20:16];
-					pad_hw_divider_q <= savestate_state_wdata_i[29:21];
-					pad_hw_edge_count_q <= savestate_state_wdata_i[35:30];
-					pad_hw_clock_q <= savestate_state_wdata_i[36];
-					pad_hw_latch_q <= savestate_state_wdata_i[37];
-				end
-				5'd3: begin
-					comm_tx_shift_q <= savestate_state_wdata_i[7:0];
-					comm_tx_latched_q <= savestate_state_wdata_i[15:8];
-					comm_tx_q <= savestate_state_wdata_i[23:16];
-					comm_cc_irq_q <= savestate_state_wdata_i[24];
-					comm_c_irq_q <= savestate_state_wdata_i[25];
-					comm_cc_wr_q <= savestate_state_wdata_i[26];
-					comm_cc_smp_q <= savestate_state_wdata_i[27];
-					comm_cc_sig_q <= savestate_state_wdata_i[28];
-					comm_cc_int_lev_q <= savestate_state_wdata_i[29];
-					comm_cc_int_inh_q <= savestate_state_wdata_i[30];
-					link_clk_prev_q <= savestate_state_wdata_i[31];
-					comm_clk_phase_q <= savestate_state_wdata_i[32];
-					comm_half_divider_q <= savestate_state_wdata_i[40:33];
-					comm_bit_count_q <= savestate_state_wdata_i[44:41];
-					comm_busy_q <= savestate_state_wdata_i[45];
-					comm_clk_sel_q <= savestate_state_wdata_i[46];
-					comm_irq_en_n_q <= savestate_state_wdata_i[47];
-				end
-				5'd4: begin
-					comm_rx_shift_q <= savestate_state_wdata_i[7:0];
-					comm_rx_q <= savestate_state_wdata_i[15:8];
-				end
 				5'd5: begin
 					rumble_freq_q <= savestate_state_wdata_i[1:0];
 					rumble_last_effect_q <= savestate_state_wdata_i[9:2];
@@ -1058,8 +1258,6 @@ module vb_vue_io
 					rumble_play_active_q <= savestate_state_wdata_i[46];
 				end
 				5'd7: begin
-					wait_rom1_q <= savestate_state_wdata_i[0];
-					wait_exp1_q <= savestate_state_wdata_i[1];
 					rumble_init_idx_q <= savestate_state_wdata_i[7:2];
 					rumble_init_busy_q <= savestate_state_wdata_i[8];
 					rumble_small_q <= savestate_state_wdata_i[16:9];
@@ -1086,66 +1284,6 @@ module vb_vue_io
 				end
 			endcase
 		end else if (ce_i) begin
-			if (timer_base_tick_w) begin
-				timer_divider_q <= 9'd0;
-				if (timer_subtick_q == 3'd4) begin
-					timer_subtick_q <= 3'd0;
-				end else begin
-					timer_subtick_q <= timer_subtick_q + 3'd1;
-				end
-
-				if (timer_counter_tick_w) begin
-					if (timer_reload_pending_q) begin
-						timer_counter_q <= timer_reload_q;
-						timer_reload_pending_q <= 1'b0;
-					end else if (timer_counter_q == 16'h0000) begin
-						timer_counter_q <= timer_reload_q;
-					end else begin
-						timer_counter_q <= timer_counter_q - 16'd1;
-						if (timer_counter_q == 16'h0001) begin
-							timer_zero_q <= 1'b1;
-							if (timer_irq_en_q) begin
-								timer_irq_q <= 1'b1;
-							end
-						end
-					end
-				end
-			end else begin
-				timer_divider_q <= timer_divider_q + 9'd1;
-			end
-
-			if (pad_busy_q != 14'd0) begin
-				if (pad_abort_rise_w) begin
-					// Suspend only on the rising serial clock, without committing data or IRQ.
-					pad_busy_q          <= 14'd0;
-					pad_hw_divider_q    <= 9'd0;
-					pad_hw_edge_count_q <= 6'd0;
-					pad_hw_clock_q      <= 1'b1;
-					pad_hw_latch_q      <= 1'b0;
-				end else begin
-					pad_busy_q <= pad_busy_q - 14'd1;
-					if (pad_hw_divider_q == 9'd0) begin
-						pad_hw_divider_q <= PAD_HALF_CYCLES_W - 9'd1;
-						if (pad_hw_latch_q) begin
-							pad_hw_latch_q <= 1'b0;
-						end
-						pad_hw_clock_q <= ~pad_hw_clock_q;
-						if (pad_hw_edge_count_q != 6'd31) begin
-							pad_hw_edge_count_q <= pad_hw_edge_count_q + 6'd1;
-						end
-					end else begin
-						pad_hw_divider_q <= pad_hw_divider_q - 9'd1;
-					end
-					if (pad_busy_q == 14'd1) begin
-						pad_data_q <= pad_shift_q;
-						// Key IRQ needs a new press in 15:4 with bits 3:1 clear.
-						if (!pad_irq_en_n_q && pad_irq_shift_match_w) begin
-							pad_irq_q <= 1'b1;
-						end
-					end
-				end
-			end
-
 			if (rumble_init_busy_q) begin
 				rumble_chain_effect_q[rumble_init_idx_q] <= 8'h00;
 				rumble_chain_loop_q[rumble_init_idx_q] <= 3'd1;
@@ -1154,7 +1292,7 @@ module vb_vue_io
 				end else begin
 					rumble_init_idx_q <= rumble_init_idx_q + 6'd1;
 				end
-			end else if (!rumble_enable_i) begin
+			end else if (!enable_i) begin
 				// None keeps serial timing active but disconnects the rumble device.
 				rumble_stop_task();
 				rumble_write_state_q <= RUMBLE_WRITE_IDLE;
@@ -1192,29 +1330,8 @@ module vb_vue_io
 				end
 			end
 
-			link_clk_prev_q <= link_clk_i;
-
-			if (comm_busy_q) begin
-				if (comm_clk_sel_q) begin
-					if (!link_clk_prev_q && link_clk_i) begin
-						comm_shift_bit_task(link_rx_i);
-					end
-				end else if (comm_half_divider_q == 8'd0) begin
-					comm_half_divider_q <= COMM_HALF_CYCLES_W - 8'd1;
-					comm_clk_phase_q    <= ~comm_clk_phase_q;
-					if (!comm_clk_phase_q) begin
-						comm_shift_bit_task(link_rx_i);
-					end
-				end else begin
-					comm_half_divider_q <= comm_half_divider_q - 8'd1;
-				end
-			end
-
-			if (bus_write_w && (byte_lo_w || byte_hi_w)) begin
-				write8_task(bus_addr_lo_w, write_byte_w);
-			end else if (bus_write_w && half_w) begin
-				write8_task(half_addr_lo_w + 6'd0, din_i[7:0]);
-				write8_task(half_addr_lo_w + 6'd1, din_i[15:8]);
+			if (byte_valid_i && enable_i && !rumble_init_busy_q) begin
+				rumble_receive_byte_task(byte_i);
 			end
 		end
 	end

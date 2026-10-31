@@ -891,50 +891,44 @@ module VSU
 					end
 				end
 
-				// The 15.36 ms frame prescaler free-runs whenever the channel
-				// is active (Scroll, Mednafen, red-viper); Enb and the
-				// terminal latch gate only the interval count and level step.
-				if (active_q[chan_idx]) begin
-					if (envelope_phase_q[chan_idx] >=
-						(ENVELOPE_TICK_CYCLES - 19'd1)) begin
-						envelope_phase_q[chan_idx] <= 19'd0;
-						// Automatic shutoff on this same edge suppresses the
-						// coincident step (red-viper, shrooms: shutoff is
-						// processed before the envelope).
-						if (env_enable_q[chan_idx] &&
-							!env_terminal_q[chan_idx] &&
-							!(auto_q[chan_idx] &&
-							  (duration_phase_q[chan_idx] >=
-								(DURATION_TICK_CYCLES - 17'd1)) &&
-							  (duration_count_q[chan_idx] >=
-								duration_set_q[chan_idx]))) begin
-							if (env_count_q[chan_idx] >= env_interval_q[chan_idx]) begin
-								env_count_q[chan_idx] <= 3'd0;
-								if (env_dir_up_q[chan_idx]) begin
-									if (env_level_q[chan_idx] != 4'hf) begin
-										env_level_q[chan_idx] <=
-											env_level_q[chan_idx] + 4'd1;
-									end else if (env_repeat_q[chan_idx]) begin
-										env_level_q[chan_idx] <= env_reload_q[chan_idx];
-									end else begin
-										env_terminal_q[chan_idx] <= 1'b1;
-									end
-								end else if (env_level_q[chan_idx] != 4'h0) begin
+				// The base clock keeps running; channel state gates envelope steps.
+				if (envelope_phase_q[chan_idx] >=
+					(ENVELOPE_TICK_CYCLES - 19'd1)) begin
+					envelope_phase_q[chan_idx] <= 19'd0;
+					// Automatic shutoff suppresses a coincident envelope step.
+					if (active_q[chan_idx] && env_enable_q[chan_idx] &&
+						!env_terminal_q[chan_idx] &&
+						!(auto_q[chan_idx] &&
+						  (duration_phase_q[chan_idx] >=
+							(DURATION_TICK_CYCLES - 17'd1)) &&
+						  (duration_count_q[chan_idx] >=
+							duration_set_q[chan_idx]))) begin
+						if (env_count_q[chan_idx] >= env_interval_q[chan_idx]) begin
+							env_count_q[chan_idx] <= 3'd0;
+							if (env_dir_up_q[chan_idx]) begin
+								if (env_level_q[chan_idx] != 4'hf) begin
 									env_level_q[chan_idx] <=
-										env_level_q[chan_idx] - 4'd1;
+										env_level_q[chan_idx] + 4'd1;
 								end else if (env_repeat_q[chan_idx]) begin
 									env_level_q[chan_idx] <= env_reload_q[chan_idx];
 								end else begin
 									env_terminal_q[chan_idx] <= 1'b1;
 								end
+							end else if (env_level_q[chan_idx] != 4'h0) begin
+								env_level_q[chan_idx] <=
+									env_level_q[chan_idx] - 4'd1;
+							end else if (env_repeat_q[chan_idx]) begin
+								env_level_q[chan_idx] <= env_reload_q[chan_idx];
 							end else begin
-								env_count_q[chan_idx] <= env_count_q[chan_idx] + 3'd1;
+								env_terminal_q[chan_idx] <= 1'b1;
 							end
+						end else begin
+							env_count_q[chan_idx] <= env_count_q[chan_idx] + 3'd1;
 						end
-					end else begin
-						envelope_phase_q[chan_idx] <=
-							envelope_phase_q[chan_idx] + 19'd1;
 					end
+				end else begin
+					envelope_phase_q[chan_idx] <=
+						envelope_phase_q[chan_idx] + 19'd1;
 				end
 			end
 
@@ -1010,6 +1004,8 @@ module VSU
 						// (red-viper, shrooms); the pass mark terminates a
 						// later non-repeat modulation switch.
 						if (swp_frame_advance_w) begin
+							// Keep the modulation entry ready as sweep advances the shared index.
+							swp_mod_read_addr_q <= swp_post_frame_mod_index_w;
 							if (swp_mod_index_q == 5'd31) begin
 								swp_mod_mask_q <= 2'd1;
 								if (swp_repeat_q) begin
@@ -1037,7 +1033,6 @@ module VSU
 						freq_count_q[write_ch_w]     <= ~freq_cur_q[write_ch_w];
 						env_count_q[write_ch_w]      <= 3'd0;
 						env_terminal_q[write_ch_w]   <= 1'b0;
-						envelope_phase_q[write_ch_w] <= 19'd0;
 
 						if (write_ch_w < PCM_COUNT_U3) begin
 							phase_q[write_ch_w] <= 5'd0;
@@ -1094,12 +1089,11 @@ module VSU
 					end
 
 					REG_EV0: begin
+						// Load the level within the running envelope frame.
 						env_reload_q[write_ch_w]   <= write_byte_w[7:4];
 						env_dir_up_q[write_ch_w]   <= write_byte_w[3];
 						env_interval_q[write_ch_w] <= write_byte_w[2:0];
 						env_level_q[write_ch_w]    <= write_byte_w[7:4];
-						env_count_q[write_ch_w]    <= 3'd0;
-						envelope_phase_q[write_ch_w] <= 19'd0;
 
 						if ((write_ch_w == 3'd4) && !swp_mod_q) begin
 							ch5_apply_sweep_result;

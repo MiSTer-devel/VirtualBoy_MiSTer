@@ -5,13 +5,13 @@
 
 // Cartridge-facing ROM and SRAM service.
 //
-// ROM download finalization, mirroring, and runtime reads retain the sealed RC5
-// wrapper contract. Cartridge SRAM clients pass through the same restored
-// physical SDRAM service instead of using the rejected monolithic wrapper.
+// ROM download finalization and mirroring, around the SDRAM service in
+// vb_cart_sdram. CPU reads and writes pass straight through to it.
 module vb_cart_rom
 (
 	input  wire        clk_sys,
 	input  wire        clk_ram,
+	input  wire        clk_ram_pin,
 	input  wire        reset_i,
 
 	input  wire        rom_download_i,
@@ -47,6 +47,9 @@ module vb_cart_rom
 	output wire        sram_bg_done_o,
 	output wire [15:0] sram_bg_read_data_o,
 	output wire        foreground_idle_o,
+	input  wire        refresh_window_i,
+	input  wire        cpu_stopped_i,
+	output wire        quiet_o,
 
 	inout  wire [15:0] SDRAM_DQ,
 	output wire [12:0] SDRAM_A,
@@ -86,14 +89,13 @@ module vb_cart_rom
 	reg        rom_finalize_pending_q = 1'b0;
 	reg        load_pending_q = 1'b0;
 	reg        runtime_enable_ram_q = 1'b0;
-	reg [23:0] rom_mask_ram_q = 24'd0;
 
 	wire        storage_write_ready_w;
 	wire        storage_write_done_w;
 	wire        storage_read_valid_w;
 	wire [15:0] storage_read_data_w;
 	wire [23:0] req_rom_addr_w =
-		rom_mirror_addr_fn(req_addr_i, rom_mask_ram_q);
+		rom_mirror_addr_fn(req_addr_i, rom_mask_q);
 	wire runtime_read_req_w = req_valid_i && runtime_enable_ram_q;
 	wire rom_download_start_w = rom_download_i && !old_rom_download_q;
 	wire load_accept_w = rom_download_i && old_rom_download_q &&
@@ -108,37 +110,40 @@ module vb_cart_rom
 	vb_cart_sdram u_sdram (
 		.clk_sys(clk_sys),
 		.clk_ram(clk_ram),
+		.clk_ram_pin(clk_ram_pin),
 		.reset_i(reset_i),
-		.read_req_i(runtime_read_req_w),
-		.read_visible_req_i(req_valid_i),
-		.read_tag_i(req_tag_i),
-		.read_addr_i({2'b00, req_rom_addr_w}),
-		.read_valid_o(storage_read_valid_w),
-		.read_data_o(storage_read_data_w),
-		.write_req_i(load_accept_w),
-		.write_addr_i({2'b00, ioctl_addr_i[23:0]}),
-		.write_data_i(ioctl_dout_i),
-		.write_ready_o(storage_write_ready_w),
-		.write_done_o(storage_write_done_w),
+		.rom_req_i(runtime_read_req_w),
+		.rom_tag_i(req_tag_i),
+		.rom_addr_i(req_rom_addr_w),
+		.rom_data_o(storage_read_data_w),
+		.rom_valid_o(storage_read_valid_w),
 		.sram_req_i(sram_req_i),
 		.sram_we_i(sram_we_i),
 		.sram_addr_i(sram_addr_i),
-		.sram_write_data_i(sram_write_data_i),
+		.sram_data_i(sram_write_data_i),
 		.sram_be_i(sram_be_i),
-		.sram_read_lane_i(sram_read_lane_i),
+		.sram_lane_i(sram_read_lane_i),
 		.sram_tag_i(sram_tag_i),
-		.sram_read_data_o(sram_read_data_o),
-		.sram_read_valid_o(sram_read_valid_o),
-		.sram_access_done_o(sram_access_done_o),
-		.sram_bg_req_i(sram_bg_req_i),
-		.sram_bg_we_i(sram_bg_we_i),
-		.sram_bg_addr_i(sram_bg_addr_i),
-		.sram_bg_write_data_i(sram_bg_write_data_i),
-		.sram_bg_be_i(sram_bg_be_i),
-		.sram_bg_ready_o(sram_bg_ready_o),
-		.sram_bg_done_o(sram_bg_done_o),
-		.sram_bg_read_data_o(sram_bg_read_data_o),
+		.sram_data_o(sram_read_data_o),
+		.sram_valid_o(sram_read_valid_o),
+		.sram_taken_o(sram_access_done_o),
+		.load_req_i(load_accept_w),
+		.load_addr_i({2'b00, ioctl_addr_i[23:0]}),
+		.load_data_i(ioctl_dout_i),
+		.load_ready_o(storage_write_ready_w),
+		.load_done_o(storage_write_done_w),
+		.bg_req_i(sram_bg_req_i),
+		.bg_we_i(sram_bg_we_i),
+		.bg_addr_i(sram_bg_addr_i),
+		.bg_data_i(sram_bg_write_data_i),
+		.bg_be_i(sram_bg_be_i),
+		.bg_ready_o(sram_bg_ready_o),
+		.bg_done_o(sram_bg_done_o),
+		.bg_data_o(sram_bg_read_data_o),
+		.refresh_window_i(refresh_window_i),
+		.cpu_stopped_i(cpu_stopped_i),
 		.foreground_idle_o(foreground_idle_o),
+		.quiet_o(quiet_o),
 		.SDRAM_DQ(SDRAM_DQ),
 		.SDRAM_A(SDRAM_A),
 		.SDRAM_DQML(SDRAM_DQML),
@@ -155,10 +160,8 @@ module vb_cart_rom
 	always @(posedge clk_ram) begin
 		if (reset_i) begin
 			runtime_enable_ram_q <= 1'b0;
-			rom_mask_ram_q <= 24'd0;
 		end else begin
 			runtime_enable_ram_q <= rom_loaded_q && !old_rom_download_q;
-			rom_mask_ram_q <= rom_mask_q;
 		end
 	end
 

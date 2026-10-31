@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Jamie Blanks
 
-// Structural top of the Virtual Boy console: V810 CPU, VIP video, VSU sound,
-// WRAM, the VUE address decode / wait-state / I/O blocks, and the cheat
-// engine. Everything outside the console (SDRAM, DDR3, HPS, presentation)
-// attaches through the external bus and video/audio ports.
+// Structural top of the Virtual Boy console: the NVC CPU package, VIP video,
+// VSU sound, WRAM, the rumble accessory and the cheat engine. Everything
+// outside the console (SDRAM, DDR3, HPS, presentation) attaches through the
+// external bus and video/audio ports.
 module virtualboy
 #(
 	parameter [31:0]  CPU_RESET_PC          = 32'hffff_fff0,
@@ -55,6 +55,7 @@ module virtualboy
 	input  wire         side_by_side_i,
 	input  wire         compat_60hz_i,
 	input  wire [2:0]   parallax_scale_i,
+	input  wire         scanner_spinup_i,
 	input  wire         presentation_hlg_i,
 	input  wire         brightness_table_legacy_sdr_i,
 	input  wire         brightness_table_download_i,
@@ -85,6 +86,7 @@ module virtualboy
 	output wire         ext_cycle_tag_o,
 	input  wire [15:0]  ext_din_i,
 	input  wire         ext_ready_i,
+	output wire         cart_refresh_window_o,
 
 	output wire [1:0]   video_raw_l_o,
 	output wire [1:0]   video_raw_r_o,
@@ -120,10 +122,9 @@ module virtualboy
 	output wire         cpu_illegal_o
 );
 
-	// V810 package pins, split per the FPGA bidirectional-pin convention.
-	wire [31:1] cpu_pin_a_w;
+	// NVC package pins, split per the FPGA bidirectional-pin convention.
+	wire [26:1] cpu_pin_a_w;
 	wire [15:0] cpu_pin_dout_w;
-	wire [31:0] cpu_pin_dout_full_w;
 	wire        cpu_pin_dout_oe_w;
 	wire [3:0]  cpu_pin_be_w;
 	wire [1:0]  cpu_pin_st_w;
@@ -132,18 +133,15 @@ module virtualboy
 	wire        cpu_pin_rw_w;
 	wire        cpu_pin_bcyst_w;
 	wire        cpu_pin_cycle_tag_w;
+	wire        cpu_dev_mrq_w;
+	wire        cpu_vip_mrq_w;
 	wire [15:0] cpu_bus_din_raw_w;
 	wire [15:0] cpu_bus_din_w;
-	wire [31:0] cpu_bus_din_full_w = {16'd0, cpu_bus_din_w};
-	wire        vue_wait_ready_w;
 	wire        cpu_bus_ready_w;
 
-	wire        cpu_ibus_req_w   = cpu_pin_mrq_w && !cpu_pin_da_w;
-	wire        cpu_dbus_valid_w = cpu_pin_mrq_w && cpu_pin_da_w;
-
-	wire        cpu_irq_valid_w;
-	wire [3:0]  cpu_irq_level_w;
 	wire        misc_link_sync_w;
+	wire        link_tx_done_w;
+	wire [7:0]  link_tx_byte_w;
 
 	// Bit 0 carries the controller battery-low signal. Normal MiSTer joystick
 	// input leaves it low; VBTAS playback can provide the recorded state.
@@ -157,55 +155,16 @@ module virtualboy
 
 	wire        vip_bus_cs_w;
 	wire        vsu_bus_cs_w;
-	wire        misc_bus_cs_w;
-	wire        unused_bus_cs_w;
 	wire        exp_bus_cs_w;
 	wire        wram_bus_cs_w;
 	wire        sram_bus_cs_w;
 	wire        rom_bus_cs_w;
-
-	vb_vue_addr_decode u_vue_decode
-	(
-		.mrq_i       (cpu_pin_mrq_w),
-		.region_i    (cpu_pin_a_w[26:24]),
-		.vip_cs_o    (vip_bus_cs_w),
-		.vsu_cs_o    (vsu_bus_cs_w),
-		.misc_cs_o   (misc_bus_cs_w),
-		.unused_cs_o (unused_bus_cs_w),
-		.exp_cs_o    (exp_bus_cs_w),
-		.wram_cs_o   (wram_bus_cs_w),
-		.sram_cs_o   (sram_bus_cs_w),
-		.rom_cs_o    (rom_bus_cs_w)
-	);
-
-	wire ibus_sel_vip_w  = cpu_ibus_req_w && vip_bus_cs_w;
-	wire ibus_sel_vsu_w  = cpu_ibus_req_w && vsu_bus_cs_w;
-	wire ibus_sel_misc_w = cpu_ibus_req_w && misc_bus_cs_w;
-	wire ibus_sel_exp_w  = cpu_ibus_req_w && exp_bus_cs_w;
-	wire ibus_sel_wram_w = cpu_ibus_req_w && wram_bus_cs_w;
-	wire ibus_sel_sram_w = cpu_ibus_req_w && sram_bus_cs_w;
-	wire ibus_sel_rom_w  = cpu_ibus_req_w && rom_bus_cs_w;
-
-	wire dbus_sel_vip_w  = cpu_dbus_valid_w && vip_bus_cs_w;
-	wire dbus_sel_vsu_w  = cpu_dbus_valid_w && vsu_bus_cs_w;
-	wire dbus_sel_misc_w = cpu_dbus_valid_w && misc_bus_cs_w;
-	wire dbus_sel_exp_w  = cpu_dbus_valid_w && exp_bus_cs_w;
-	wire dbus_sel_wram_w = cpu_dbus_valid_w && wram_bus_cs_w;
-	wire dbus_sel_sram_w = cpu_dbus_valid_w && sram_bus_cs_w;
-	wire dbus_sel_rom_w  = cpu_dbus_valid_w && rom_bus_cs_w;
 
 	wire [15:0] vip_bus_dout_w;
 	wire        vip_bus_ready_w;
 	wire        vip_irq_w;
 
 	wire [15:0] vsu_bus_dout_w;
-
-	wire [15:0] misc_bus_dout_w;
-	wire        misc_timer_irq_w;
-	wire        misc_pad_irq_w;
-	wire        misc_comm_irq_w;
-	wire        misc_wait_exp1_w;
-	wire        misc_wait_rom1_w;
 
 	reg         cpu_phi1_q;
 	reg         video_phi1_q;
@@ -229,8 +188,12 @@ module virtualboy
 	// Savestate scalar-state address windows:
 	//   0-15  CPU        16-37 VUE I/O     38    wait control
 	//   39-63 VSU        64-112 VIP
+	// VUE rows 21-33 belong to the rumble accessory; row 23 also holds WCR.
 	wire [63:0] savestate_cpu_state_rdata_w;
-	wire [63:0] savestate_vue_state_rdata_w;
+	wire [63:0] savestate_io_state_rdata_w;
+	wire [63:0] savestate_rumble_state_rdata_w;
+	wire [63:0] savestate_vue_state_rdata_w =
+		savestate_io_state_rdata_w | savestate_rumble_state_rdata_w;
 	wire [63:0] savestate_wait_state_rdata_w;
 	wire [63:0] savestate_vsu_state_rdata_w;
 	wire [63:0] savestate_vip_state_rdata_w;
@@ -291,7 +254,6 @@ module virtualboy
 	wire        ext_bus_cycle_w = exp_bus_cs_w || sram_bus_cs_w || rom_bus_cs_w;
 
 	assign ext_a_o        = cpu_pin_a_w[23:1];
-	assign cpu_pin_dout_w = cpu_pin_dout_full_w[15:0];
 	assign ext_dout_o     = cpu_pin_dout_w;
 	assign ext_dout_oe_o  = ext_bus_cycle_w && cpu_pin_dout_oe_w;
 	assign ext_be_o       = cpu_pin_be_w;
@@ -305,13 +267,12 @@ module virtualboy
 	assign cart_ram_cs_o  = sram_bus_cs_w;
 	assign cart_rom_cs_o  = rom_bus_cs_w;
 
+	// NVC register reads are answered inside the NVC.
 	assign cpu_bus_din_raw_w =
-		(ibus_sel_vip_w  || dbus_sel_vip_w)  ? vip_bus_dout_w  :
-		(ibus_sel_vsu_w  || dbus_sel_vsu_w)  ? vsu_bus_dout_w  :
-		(ibus_sel_misc_w || dbus_sel_misc_w) ? misc_bus_dout_w :
-		(ibus_sel_wram_w || dbus_sel_wram_w) ? wram_read_data_w :
-		(ibus_sel_exp_w  || ibus_sel_sram_w || ibus_sel_rom_w ||
-		 dbus_sel_exp_w  || dbus_sel_sram_w || dbus_sel_rom_w) ? ext_din_i :
+		vip_bus_cs_w    ? vip_bus_dout_w   :
+		vsu_bus_cs_w    ? vsu_bus_dout_w   :
+		wram_bus_cs_w   ? wram_read_data_w :
+		ext_bus_cycle_w ? ext_din_i        :
 		16'h0000;
 
 	vb_cheat_engine u_cheat_engine
@@ -325,21 +286,6 @@ module virtualboy
 		.data_o      (cpu_bus_din_w),
 		.available_o ()
 	);
-
-	assign cpu_irq_valid_w =
-		vip_irq_w |
-		misc_comm_irq_w |
-		cart_irq_i |
-		misc_timer_irq_w |
-		misc_pad_irq_w;
-
-	assign cpu_irq_level_w =
-		vip_irq_w        ? 4'd4 :
-		misc_comm_irq_w  ? 4'd3 :
-		cart_irq_i       ? 4'd2 :
-		misc_timer_irq_w ? 4'd1 :
-		misc_pad_irq_w   ? 4'd0 :
-		4'd0;
 
 	assign savestate_pause_ready_o =
 		savestate_core_drain_q && savestate_video_drain_q &&
@@ -397,7 +343,6 @@ module virtualboy
 	end
 
 	// Optional timing outputs used by VirtualBoyApp diagnostics.
-	assign timer_irq_o      = misc_timer_irq_w;
 	assign cpu_bus_mrq_o    = cpu_pin_mrq_w;
 	assign cpu_bus_ready_o  = cpu_bus_ready_w;
 	assign cpu_bus_region_o = cpu_pin_a_w[26:24];
@@ -407,32 +352,82 @@ module virtualboy
 	assign cpu_bus_bcyst_o  = cpu_pin_bcyst_w;
 	assign ext_cycle_tag_o  = cpu_pin_cycle_tag_w;
 
-	NECv810 #(
-		.RESET_PC  (CPU_RESET_PC),
-		.RESET_PSW (CPU_RESET_PSW)
-	) u_cpu (
+	// The SDRAM backup hold is a MiSTer addition, so it joins the NVC's READY
+	// from outside its wait model. It applies only to
+	// SDRAM-backed regions (ROM and cartridge SRAM) and stays combinational:
+	// data returned in the last moment before a CPU CE edge is consumed at
+	// that edge without an extra wait cycle, while a delayed return (an
+	// unlucky refresh) stretches READY so the CPU never latches incomplete
+	// data.
+	wire cpu_ext_ready_w = (!rom_bus_cs_w && !sram_bus_cs_w) || ext_ready_i;
+
+	vb_nvc #(
+		.CPU_RESET_PC  (CPU_RESET_PC),
+		.CPU_RESET_PSW (CPU_RESET_PSW)
+	) u_nvc (
 		.clk_i                   (clk_i),
 		.reset_i                 (reset_i),
 		.ce_i                    (core_ce_w),
 		.phi1_i                  (cpu_phi1_w),
-		// WCR sets the base wait; VIP and memory may hold READY longer.
-		.ready_i                 (cpu_bus_ready_w),
-		.din_i                   (cpu_bus_din_full_w),
-		.hldrq_i                 (1'b0),
-		.icheen_i                (1'b1),
-		.siz16b_i                (1'b1),
-		.szrq_i                  (1'b1),
 
-		.irq_valid_i             (cpu_irq_valid_w),
-		.irq_level_i             (cpu_irq_level_w),
-		.nmi_i                   (1'b0),
+		.a_o                     (cpu_pin_a_w),
+		.dout_o                  (cpu_pin_dout_w),
+		.dout_oe_o               (cpu_pin_dout_oe_w),
+		.be_o                    (cpu_pin_be_w),
+		.st_o                    (cpu_pin_st_w),
+		.da_o                    (cpu_pin_da_w),
+		.rw_o                    (cpu_pin_rw_w),
+		.mrq_o                   (cpu_pin_mrq_w),
+		.bcyst_o                 (cpu_pin_bcyst_w),
+		.cycle_tag_o             (cpu_pin_cycle_tag_w),
+		.dev_mrq_o               (cpu_dev_mrq_w),
+		.vip_mrq_o               (cpu_vip_mrq_w),
+		.vip_cs_o                (vip_bus_cs_w),
+		.vsu_cs_o                (vsu_bus_cs_w),
+		.exp_cs_o                (exp_bus_cs_w),
+		.wram_cs_o               (wram_bus_cs_w),
+		.sram_cs_o               (sram_bus_cs_w),
+		.rom_cs_o                (rom_bus_cs_w),
+		.din_i                   (cpu_bus_din_w),
+		.vip_ready_i             (vip_bus_ready_w),
+		.ext_ready_i             (cpu_ext_ready_w),
+		.refresh_busy_o          (cart_refresh_window_o),
+		.ready_o                 (cpu_bus_ready_w),
+
+		.vip_irq_i               (vip_irq_w),
+		.cart_irq_i              (cart_irq_i),
+
+		.pad_sample_i            (pad_sample_w),
+		.pad_latch_o             (pad_latch_o),
+		.pad_clock_o             (pad_clock_o),
+
+		.link_comcnt_i           (link_comcnt_eff_w),
+		.link_clk_i              (link_clk_eff_w),
+		.link_rx_i               (link_rx_eff_w),
+		.link_sync_i             (link_sync_eff_w),
+		.link_comcnt_o           (link_comcnt_o),
+		.link_clk_o              (link_clk_o),
+		.link_tx_o               (link_tx_o),
+		.link_sync_o             (misc_link_sync_w),
+		.link_tx_done_o          (link_tx_done_w),
+		.link_tx_byte_o          (link_tx_byte_w),
+
+		.timer_tick_o            (timer_tick_o),
+		.timer_zero_o            (timer_zero_o),
+		.timer_irq_o             (timer_irq_o),
+
 		.savestate_pause_req_i   (savestate_pause_req_i),
 		.savestate_pause_ready_o (savestate_cpu_ready_w),
 		.savestate_restore_i     (savestate_restore_i),
-		.savestate_state_addr_i  (savestate_state_addr_i[3:0]),
 		.savestate_state_wdata_i (savestate_state_wdata_i),
-		.savestate_state_wren_i  (savestate_cpu_state_wren_w),
-		.savestate_state_rdata_o (savestate_cpu_state_rdata_w),
+		.savestate_cpu_addr_i    (savestate_state_addr_i[3:0]),
+		.savestate_cpu_wren_i    (savestate_cpu_state_wren_w),
+		.savestate_cpu_rdata_o   (savestate_cpu_state_rdata_w),
+		.savestate_io_addr_i     (savestate_vue_state_addr_w),
+		.savestate_io_wren_i     (savestate_vue_state_wren_w),
+		.savestate_io_rdata_o    (savestate_io_state_rdata_w),
+		.savestate_wait_wren_i   (savestate_wait_state_wren_w),
+		.savestate_wait_rdata_o  (savestate_wait_state_rdata_w),
 		.savestate_mem_active_i  (savestate_cpu_mem_active_w),
 		.savestate_mem_addr_i    (savestate_mem_addr_i[10:0]),
 		.savestate_mem_rden_i    (savestate_mem_rden_i),
@@ -440,37 +435,13 @@ module virtualboy
 		.savestate_mem_wdata_i   (savestate_mem_wdata_i),
 		.savestate_mem_rdata_o   (savestate_cpu_mem_rdata_w),
 
-		.a_o                     (cpu_pin_a_w),
-		.a_oe_o                  (),
-		.dout_o                  (cpu_pin_dout_full_w),
-		.dout_oe_o               (cpu_pin_dout_oe_w),
-		.dout_lane_oe_o          (),
-		.be_o                    (cpu_pin_be_w),
-		.be_oe_o                 (),
-		.st_o                    (cpu_pin_st_w),
-		.st_oe_o                 (),
-		.da_o                    (cpu_pin_da_w),
-		.da_oe_o                 (),
-		.mrq_o                   (cpu_pin_mrq_w),
-		.mrq_oe_o                (),
-		.rw_o                    (cpu_pin_rw_w),
-		.rw_oe_o                 (),
-		.bcyst_o                 (cpu_pin_bcyst_w),
-		.bcyst_oe_o              (),
-		.adrs_err_n_o            (),
-		.cycle_tag_o             (cpu_pin_cycle_tag_w),
-		.block_o                 (),
-		.hldak_o                 (),
-
 		.dbg_reg_addr_i          (dbg_reg_addr_i),
 		.dbg_reg_data_o          (dbg_reg_data_o),
 		.dbg_pc_o                (dbg_pc_o),
 		.dbg_psw_o               (dbg_psw_o),
-
 		.trace_valid_o           (trace_valid_o),
 		.trace_pc_o              (trace_pc_o),
 		.trace_insn_o            (trace_insn_o),
-
 		.halted_o                (cpu_halted_o),
 		.illegal_o               (cpu_illegal_o)
 	);
@@ -509,19 +480,17 @@ module virtualboy
 		.savestate_mem_wren_i            (savestate_mem_wren_i),
 		.savestate_mem_wdata_i           (savestate_mem_wdata_i),
 		.savestate_mem_rdata_o           (savestate_vip_mem_rdata_w),
-
 		.cs_i                            (vip_bus_cs_w),
 		.a_i                             (cpu_pin_a_w[23:1]),
 		.din_i                           (cpu_pin_dout_w),
 		.be_i                            (cpu_pin_be_w),
 		.st_i                            (cpu_pin_st_w),
 		.da_i                            (cpu_pin_da_w),
-		.mrq_i                           (cpu_pin_mrq_w),
+		.mrq_i                           (cpu_vip_mrq_w),
 		.rw_i                            (cpu_pin_rw_w),
 		.bcyst_i                         (cpu_pin_bcyst_w),
 		.dout_o                          (vip_bus_dout_w),
 		.ready_o                         (vip_bus_ready_w),
-
 		.irq_o                           (vip_irq_w),
 		.flat_dual_eye_i                 (flat_dual_eye_i),
 		.side_by_side_i                  (side_by_side_i),
@@ -540,7 +509,8 @@ module virtualboy
 		.video_hblank_o                  (video_hblank_o),
 		.video_vblank_o                  (video_vblank_o),
 		.video_hsync_o                   (video_hsync_o),
-		.video_vsync_o                   (video_vsync_o)
+		.video_vsync_o                   (video_vsync_o),
+		.scanner_spinup_i                (scanner_spinup_i)
 	);
 
 	VSU u_vsu
@@ -555,7 +525,7 @@ module virtualboy
 		.be_i                    (cpu_pin_be_w),
 		.st_i                    (cpu_pin_st_w),
 		.da_i                    (cpu_pin_da_w),
-		.mrq_i                   (cpu_pin_mrq_w),
+		.mrq_i                   (cpu_dev_mrq_w),
 		.rw_i                    (cpu_pin_rw_w),
 		.dout_o                  (vsu_bus_dout_w),
 		.ready_o                 (),
@@ -600,93 +570,20 @@ module virtualboy
 		.q_o     (wram_peek_l_w)
 	);
 
-	// VUE timer, controller, communication, WCR, and rumble.
-	vb_vue_io u_misc
+	vb_rumble_pak u_rumble
 	(
 		.clk_i                   (clk_i),
 		.reset_i                 (reset_i),
 		.ce_i                    (core_ce_w),
-
-		.pad_sample_i            (pad_sample_w),
-		.rumble_enable_i         (rumble_enable_i),
-		.link_comcnt_i           (link_comcnt_eff_w),
-		.link_clk_i              (link_clk_eff_w),
-		.link_rx_i               (link_rx_eff_w),
-		.link_sync_i             (link_sync_eff_w),
-
-		.cs_i                    (misc_bus_cs_w),
-		.a_i                     (cpu_pin_a_w[23:1]),
-		.din_i                   (cpu_pin_dout_w),
-		.be_i                    (cpu_pin_be_w),
-		.st_i                    (cpu_pin_st_w),
-		.da_i                    (cpu_pin_da_w),
-		.mrq_i                   (cpu_pin_mrq_w),
-		.rw_i                    (cpu_pin_rw_w),
-		.ready_i                 (cpu_bus_ready_w),
-		.dout_o                  (misc_bus_dout_w),
-
-		.pad_latch_o             (pad_latch_o),
-		.pad_clock_o             (pad_clock_o),
-		.link_comcnt_o           (link_comcnt_o),
-		.link_clk_o              (link_clk_o),
-		.link_tx_o               (link_tx_o),
-		.link_sync_o             (misc_link_sync_w),
+		.enable_i                (rumble_enable_i),
+		.byte_valid_i            (link_tx_done_w),
+		.byte_i                  (link_tx_byte_w),
 		.rumble_o                (rumble_o),
-
-		.timer_tick_o            (timer_tick_o),
-		.timer_zero_o            (timer_zero_o),
-		.timer_irq_o             (misc_timer_irq_w),
-		.pad_irq_o               (misc_pad_irq_w),
-		.comm_irq_o              (misc_comm_irq_w),
-		.wait_exp1_o             (misc_wait_exp1_w),
-		.wait_rom1_o             (misc_wait_rom1_w),
 		.savestate_state_addr_i  (savestate_vue_state_addr_w),
 		.savestate_state_wdata_i (savestate_state_wdata_i),
 		.savestate_state_wren_i  (savestate_vue_state_wren_w),
-		.savestate_state_rdata_o (savestate_vue_state_rdata_w)
+		.savestate_state_rdata_o (savestate_rumble_state_rdata_w)
 	);
-
-	vb_vue_wait_control u_wait_control
-	(
-		.clk_i                   (clk_i),
-		.reset_i                 (reset_i),
-		.ce_i                    (core_ce_w),
-
-		.mrq_i                   (cpu_pin_mrq_w),
-		.bcyst_i                 (cpu_pin_bcyst_w),
-		.a_i                     (cpu_pin_a_w[26:1]),
-		.be_i                    (cpu_pin_be_w),
-		.st_i                    (cpu_pin_st_w),
-		.da_i                    (cpu_pin_da_w),
-		.rw_i                    (cpu_pin_rw_w),
-
-		.vip_cs_i                (vip_bus_cs_w),
-		.vsu_cs_i                (vsu_bus_cs_w),
-		.misc_cs_i               (misc_bus_cs_w),
-		.unused_cs_i             (unused_bus_cs_w),
-		.exp_cs_i                (exp_bus_cs_w),
-		.wram_cs_i               (wram_bus_cs_w),
-		.sram_cs_i               (sram_bus_cs_w),
-		.rom_cs_i                (rom_bus_cs_w),
-
-		.wait_exp1_i             (misc_wait_exp1_w),
-		.wait_rom1_i             (misc_wait_rom1_w),
-		.vip_ready_i             (vip_bus_ready_w),
-		.ready_o                 (vue_wait_ready_w),
-		.savestate_state_wdata_i (savestate_state_wdata_i),
-		.savestate_state_wren_i  (savestate_wait_state_wren_w),
-		.savestate_state_rdata_o (savestate_wait_state_rdata_w)
-	);
-
-	// The SDRAM backup hold is not part of the original console, so it gates
-	// the CPU READY pin here instead of inside the VUE wait model. It applies
-	// only to SDRAM-backed regions (ROM and cartridge SRAM) and stays
-	// combinational: data returned in the last moment before a CPU CE edge is
-	// consumed at that edge without an extra wait cycle, while a delayed
-	// return (an unlucky refresh) stretches READY so the CPU never latches
-	// incomplete data.
-	assign cpu_bus_ready_w = vue_wait_ready_w &&
-		((!rom_bus_cs_w && !sram_bus_cs_w) || ext_ready_i);
 
 	always @(posedge clk_i or posedge reset_i) begin
 		if (reset_i) begin

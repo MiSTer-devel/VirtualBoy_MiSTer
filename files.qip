@@ -21,7 +21,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/Savestates/statemanager.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/Savestates/savestates.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/Savestates/savestate_ui.sv
 set_global_assignment -name VERILOG_FILE rtl/vue.v
-# Production uses the VIP implementation below.
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_nvc.sv
 set_global_assignment -name QIP_FILE rtl/VIP/vip.qip
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/VSU/VSU.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/VSU/vsu_rc_highpass.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Audio/audio_resampler.sv
 set_global_assignment -name VERILOG_FILE rtl/virtualboy.v

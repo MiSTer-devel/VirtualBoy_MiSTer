@@ -1,13 +1,14 @@
 # Copyright (c) 2026 Jamie Blanks
 
-# VIP synthesis source list.
-set_global_assignment -name MIF_FILE [file join $::quartus(qip_path) "vip_luma_temporal_sdr22_hlg700_e1023_even.mif"]
-set_global_assignment -name MIF_FILE [file join $::quartus(qip_path) "vip_luma_temporal_sdr22_hlg700_e1023_odd.mif"]
-set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_core.sv"]
-set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_column_table_timing.sv"]
-set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_native_framebuffer_capture.sv"]
-set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_host_display.sv"]
-set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_render_storage.sv"]
+# The VIP. The luma tables beside it are loaded by path.
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_host.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_mem.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_scanner.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_dp.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_present.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_xp.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_strip.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_bg.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_obj.sv"]
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_stereo_scale_signed.sv"]
-set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_render_engines.sv"]
-set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "vip_hbias_affine.sv"]

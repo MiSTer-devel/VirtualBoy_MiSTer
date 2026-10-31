@@ -11,6 +11,14 @@ Lite Builds
 .qsys_edit
 PLLJ_PLLSPE_INFO.txt
 .DS_Store
+.agents
+references
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.codex/
+/.beads/
+/.qmd/
 *.bak
 *.orig
 *.rej
@@ -37,3 +45,10 @@ c5_pin_model_dump.txt
 *~
 *.xml
 *.cdf
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*

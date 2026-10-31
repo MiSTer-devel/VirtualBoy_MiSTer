@@ -156,7 +156,7 @@ module emu
 	assign LED_POWER  = 0;
 	assign BUTTONS[1] = 1'b0;
 
-	assign AUDIO_S = 1'b0;
+	assign AUDIO_S = 1'b1;
 
 	`ifdef MISTER_FB
 	assign FB_EN          = 1'b0;
@@ -178,19 +178,22 @@ module emu
 
 	// clk_sys is a 40 MHz PLL output, twice the 20 MHz Virtual Boy clock.
 	wire clk_sys;
-	// clk_ram is the 120 MHz PLL output used by the SDRAM controller. It is 3x
-	// clk_sys (40 MHz) from the same PLL, so the two domains are phase-aligned
-	// (every clk_sys edge lands on a clk_ram edge), which lets the cartridge
-	// bridge cross with a two-stage handoff instead of a deeper synchronizer.
-	// The controller creates its physical inverted SDRAM pin clock internally.
+	// clk_ram is the 80 MHz PLL output used by the SDRAM controller, 2x clk_sys
+	// from the same PLL: every clk_sys edge lands on a clk_ram edge, so the
+	// cartridge path crosses with plain registers. The controller creates its
+	// physical inverted SDRAM pin clock internally.
 	wire clk_ram;
+	// clk_ram 1.875 ns early: it forwards SDRAM_CLK, so read data reaches the
+	// capture edge with margin in every corner.
+	wire clk_ram_pin;
 	wire pll_locked;
 
 	pll pll (
 		.refclk   (CLK_50M),
 		.rst      (1'b0),
 		.outclk_0 (clk_sys), // 40 MHz
-		.outclk_1 (clk_ram), // 120 MHz (3x clk_sys)
+		.outclk_1 (clk_ram), // 80 MHz (2x clk_sys)
+		.outclk_2 (clk_ram_pin), // 80 MHz, -1.875 ns
 		.locked   (pll_locked)
 	);
 
@@ -288,7 +291,7 @@ module emu
 		"-;",
 		"P1,Audio & Video;",
 		"P1-;",
-		"P1O[5:3],Color Mode,Red,Multicolor,Palette,Anaglyph,ColorCode,TriOviz,Custom;",
+		"P1O[5:3],Color Mode,Natural,Multicolor,Palette,Anaglyph,ColorCode,TriOviz,Custom,Pure Red;",
 		"H1P1FC3,GBP,Load Palette;",
 		"H1P1O[41],Use True Black,On,Off;",
 		"H0P1O[14:12],L Color,Red,Magenta,Blue,Cyan,Green,Yellow,White;",
@@ -309,6 +312,7 @@ module emu
 		"P2-;",
 		"P2O[40],Enable Large SRAM,Off,On;",
 		"P2O[28],Serial Port,Rumble,None;",
+		"P2O[30],Mirror Spin-up Delay,Off,On;",
 		"P2O[44],Savestates to SD Card,On,Off;",
 		"P2-;",
 		"P2R9,Load Backup RAM;",
@@ -533,6 +537,7 @@ module emu
 
 	// MiSTer sends an index-255 transfer whenever cheats are enabled or disabled.
 	// Reload the table live; tying that transfer to reset would reboot the game.
+	reg  cart_cpu_run_q = 1'b0;
 	wire savestate_control_reset = reset_button | ~pll_locked | rom_download |
 		~rom_loaded | cart_ram_clear_busy | tas_hold_reset;
 	wire logic_reset = reset_button | ~pll_locked | new_rom_pulse |
@@ -540,7 +545,19 @@ module emu
 	wire core_reset = savestate_control_reset |
 		savestate_reset_ss;
 	wire core_ce = ce_20m & core_execution_enable &
-		~savestate_pause_active_q;
+		~savestate_pause_active_q & cart_cpu_run_q;
+
+	// While the CPU is stopped the cart SDRAM refreshes on a timer and serves
+	// HPS traffic. The CPU restarts only once that has finished, so its first
+	// cartridge access always finds the SDRAM idle.
+	wire cart_sdram_quiet_w;
+	wire cart_cpu_stopped_w = core_reset | ~core_execution_enable |
+		savestate_pause_active_q;
+	always @(posedge clk_sys) begin
+		if (!pll_locked) cart_cpu_run_q <= 1'b0;
+		else cart_cpu_run_q <= !cart_cpu_stopped_w &&
+			(cart_cpu_run_q || cart_sdram_quiet_w);
+	end
 
 	assign LED_USER = rom_download | palette_download |
 		brightness_table_download | tas_download | cheat_download |
@@ -640,8 +657,7 @@ module emu
 	reg        p1_cpu_dirty_pulse_q = 1'b0;
 	reg        savestate_sram_ready_q = 1'b0;
 	reg [7:0]  savestate_sram_data_q = 8'hff;
-	reg        p1_cpu_write_seen_valid_q = 1'b0;
-	reg        p1_cpu_write_seen_tag_q = 1'b0;
+	reg        cpu_shadow_dirty_q = 1'b0;
 
 	wire        rom_core_req_w = ext_mrq && cart_rom_cs && ext_rw;
 	wire [15:0] rom_cpu_data_w;
@@ -654,6 +670,7 @@ module emu
 	wire        p1_background_done_w;
 	wire [15:0] p1_response_data_w;
 	wire        sdram_foreground_idle_w;
+	wire        cart_refresh_window_w;
 
 	wire p1_shadow_ack_pulse_w;
 	wire p1_sdram_complete_w = p1_sdram_done_q || p1_background_done_w;
@@ -719,7 +736,14 @@ module emu
 	reg         save_stage_ddr_ack_pulse_q = 1'b0;
 	reg         cpu_shadow_seen_valid_q = 1'b0;
 	reg         cpu_shadow_seen_tag_q = 1'b0;
-	reg         cpu_shadow_done_q = 1'b0;
+	// CPU SRAM writes wait here for DDR ch1; eight entries of {addr, data, be}.
+	reg  [40:0] cpu_shadow_fifo_q [0:7];
+	reg   [2:0] cpu_shadow_wr_q = 3'd0;
+	reg   [2:0] cpu_shadow_rd_q = 3'd0;
+	reg   [3:0] cpu_shadow_count_q = 4'd0;
+	wire        cpu_shadow_full_w = cpu_shadow_count_q == 4'd8;
+	reg         cpu_shadow_hold_q = 1'b0;
+	wire [40:0] cpu_shadow_head_w = cpu_shadow_fifo_q[cpu_shadow_rd_q];
 
 	assign sd_lba = save_sd_lba;
 
@@ -821,45 +845,54 @@ module emu
 	wire [1:0] sram_cpu_be_w = cpu_sram_backing_lane_w ? 2'b10 : 2'b01;
 	wire cpu_shadow_match_w = cpu_shadow_seen_valid_q &&
 		(cpu_shadow_seen_tag_q == ext_cycle_tag);
-	wire cpu_shadow_req_w = p1_cpu_write_req_w &&
-		(!cpu_shadow_seen_valid_q ||
-		 (cpu_shadow_seen_tag_q != ext_cycle_tag));
+	wire cpu_shadow_push_w = p1_cpu_write_req_w && !cpu_shadow_match_w &&
+		!cpu_shadow_full_w;
+	wire cpu_shadow_pop_w;
 	wire p1_shadow_req_w = p1_sys_busy_q && p1_request_write_sys_q &&
 		!p1_shadow_done_q;
 	assign p1_shadow_ack_pulse_w = shadow_ddr_busy_q && shadow_ddr_ack_w &&
 		(shadow_ddr_source_q == SHADOW_SOURCE_P1);
-	assign sram_cpu_access_done_w = sram_cpu_sdram_done_w &&
-		cpu_shadow_match_w && cpu_shadow_done_q;
+	assign sram_cpu_access_done_w = sram_cpu_sdram_done_w && cpu_shadow_match_w;
 	wire p1_cpu_read_ready_w = p1_cpu_read_req_w && sram_cpu_valid_w;
-	wire p1_cpu_write_ready_w = !p1_cpu_write_req_w || sram_cpu_access_done_w;
-	wire p1_cpu_ready_w = ext_rw ? p1_cpu_read_ready_w : p1_cpu_write_ready_w;
 	wire rom_cpu_resp_ready_w = rom_core_req_w && rom_cpu_valid_w;
-	wire cart_access_ready_w = cart_rom_cs ?
-		(ext_rw ? rom_cpu_resp_ready_w : 1'b1) :
-		cart_ram_cs ? p1_cpu_ready_w : 1'b1;
+	// READY comes from the console wait counter. The only hold is a CPU SRAM
+	// write that finds the shadow queue full, which takes a DDR3 stall long
+	// enough to back up eight writes; it is a register, so READY never sees the
+	// cart logic.
+	wire cart_access_ready_w = !cpu_shadow_hold_q;
 
 	assign ext_din = cart_rom_cs ? rom_cpu_data_w :
 		cart_ram_cs ? sram_cpu_data_w : 16'hffff;
 
 	`ifndef SYNTHESIS
-	// ROM and cartridge SRAM keep their hardware wait counts as a minimum. READY
-	// may stretch beyond that edge, but it must never expose an incomplete read.
+	// READY does not wait for the SDRAM. A cartridge cycle is accepted on the
+	// CE edge after which its tag changes or MRQ drops, so its data must have
+	// been there just before that edge.
+	wire cart_cycle_w = rom_core_req_w || p1_cpu_read_req_w || p1_cpu_write_req_w;
+	wire cart_cycle_ok_w = rom_core_req_w ? rom_cpu_resp_ready_w :
+		p1_cpu_read_req_w ? p1_cpu_read_ready_w : sram_cpu_access_done_w;
+	reg     cart_check_active_q = 1'b0;
+	reg     cart_check_tag_q = 1'b0;
+	reg     cart_check_ok_q = 1'b0;
+	reg     cart_check_rom_q = 1'b0;
+	integer cart_check_age = 0;
+	integer cart_check_age_q = 0;
 	always @(posedge clk_sys) begin
-		if (pll_locked && rom_loaded && core_execution_enable &&
-			!core_reset && cpu_bus_mrq && cpu_bus_ready && cpu_bus_rw &&
-			(cpu_bus_region == 3'b111) && !rom_cpu_resp_ready_w) begin
-			$error("ROM READY asserted without a tagged SDRAM response");
-		end
-		if (pll_locked && rom_loaded && core_execution_enable &&
-			!core_reset && cpu_bus_mrq && cpu_bus_ready &&
-			(cpu_bus_region == 3'b110)) begin
-			if (cpu_bus_rw && !p1_cpu_read_ready_w) begin
-				$error("SRAM READY asserted without a tagged SDRAM response");
+		if (!cart_cycle_w || (ext_cycle_tag != cart_check_tag_q) || !cart_check_active_q)
+			cart_check_age = 1;
+		else
+			cart_check_age = cart_check_age + 1;
+		if (pll_locked && core_ce && !core_reset) begin
+			if (cart_check_active_q && !cart_check_ok_q &&
+				(!cart_cycle_w || (ext_cycle_tag != cart_check_tag_q))) begin
+				$error("%0s cycle accepted without its SDRAM data, %0d ns after the address",
+					cart_check_rom_q ? "ROM" : "SRAM", cart_check_age_q * 25);
 			end
-			if (!cpu_bus_rw && p1_cpu_write_req_w &&
-				!sram_cpu_access_done_w) begin
-				$error("SRAM write missed the fixed CPU READY edge");
-			end
+			cart_check_active_q <= cart_cycle_w;
+			cart_check_tag_q <= ext_cycle_tag;
+			cart_check_ok_q <= cart_cycle_ok_w;
+			cart_check_rom_q <= rom_core_req_w;
+			cart_check_age_q <= cart_check_age;
 		end
 	end
 	`endif
@@ -875,8 +908,6 @@ module emu
 			p1_sdram_done_q <= 1'b0;
 			p1_shadow_done_q <= 1'b0;
 			p1_cpu_dirty_pulse_q <= 1'b0;
-			p1_cpu_write_seen_valid_q <= 1'b0;
-			p1_cpu_write_seen_tag_q <= 1'b0;
 			savestate_sram_ready_q <= 1'b0;
 			savestate_sram_data_q <= 8'hff;
 			cart_sram_init_busy <= 1'b0;
@@ -890,19 +921,15 @@ module emu
 				p1_shadow_done_q <= 1'b1;
 			end
 
-			if (logic_reset) begin
-				p1_cpu_write_seen_valid_q <= 1'b0;
-			end else begin
-				if (!p1_cpu_write_req_w) begin
-					p1_cpu_write_seen_valid_q <= 1'b0;
-				end else if (p1_cpu_write_ready_w &&
-					(!p1_cpu_write_seen_valid_q ||
-					(ext_cycle_tag != p1_cpu_write_seen_tag_q))) begin
-					p1_cpu_write_seen_valid_q <= 1'b1;
-					p1_cpu_write_seen_tag_q <= ext_cycle_tag;
-					p1_cpu_dirty_pulse_q <= 1'b1;
-				end
+			// A save started from the dirty pulse must see every queued write
+			// in the shadow, so the pulse waits for the queue to drain.
+			if (cpu_shadow_dirty_q && (cpu_shadow_count_q == 4'd0) &&
+				!(shadow_ddr_busy_q &&
+				  (shadow_ddr_source_q == SHADOW_SOURCE_CPU))) begin
+				cpu_shadow_dirty_q <= 1'b0;
+				p1_cpu_dirty_pulse_q <= 1'b1;
 			end
+			if (cpu_shadow_push_w) cpu_shadow_dirty_q <= 1'b1;
 
 			if (savestate_sram_ready_q &&
 				(!savestate_sram_req_raw_w ||
@@ -974,6 +1001,8 @@ module emu
 		end
 	end
 
+	assign cpu_shadow_pop_w = !shadow_ddr_busy_q && (cpu_shadow_count_q != 4'd0);
+
 	// Serialize byte-enabled shadow maintenance and save prefetches on DDR ch2.
 	// CPU/background writes have priority over a new save read. A dirty pulse is
 	// emitted only after both canonical SDRAM and its shadow have committed, so a
@@ -992,7 +1021,10 @@ module emu
 			save_stage_ddr_ack_pulse_q <= 1'b0;
 			cpu_shadow_seen_valid_q <= 1'b0;
 			cpu_shadow_seen_tag_q <= 1'b0;
-			cpu_shadow_done_q <= 1'b0;
+			cpu_shadow_wr_q <= 3'd0;
+			cpu_shadow_rd_q <= 3'd0;
+			cpu_shadow_count_q <= 4'd0;
+			cpu_shadow_hold_q <= 1'b0;
 		end else begin
 			shadow_ddr_req_q <= 1'b0;
 			save_stage_ddr_ack_pulse_q <= 1'b0;
@@ -1005,16 +1037,24 @@ module emu
 			end
 			if (!p1_cpu_write_req_w) begin
 				cpu_shadow_seen_valid_q <= 1'b0;
-				cpu_shadow_done_q <= 1'b0;
 			end
+			cpu_shadow_hold_q <= p1_cpu_write_req_w && !cpu_shadow_match_w &&
+				cpu_shadow_full_w;
+			if (cpu_shadow_push_w) begin
+				cpu_shadow_fifo_q[cpu_shadow_wr_q] <= {sram_cpu_addr_w[23:1],
+					sram_cpu_write_data_w, sram_cpu_be_w};
+				cpu_shadow_wr_q <= cpu_shadow_wr_q + 3'd1;
+				cpu_shadow_seen_valid_q <= 1'b1;
+				cpu_shadow_seen_tag_q <= ext_cycle_tag;
+			end
+			if (cpu_shadow_pop_w) cpu_shadow_rd_q <= cpu_shadow_rd_q + 3'd1;
+			cpu_shadow_count_q <= cpu_shadow_count_q +
+				{3'd0, cpu_shadow_push_w} - {3'd0, cpu_shadow_pop_w};
 
 			if (shadow_ddr_busy_q) begin
 				if (shadow_ddr_ack_w) begin
 					shadow_ddr_busy_q <= 1'b0;
 					case (shadow_ddr_source_q)
-						SHADOW_SOURCE_CPU: begin
-							cpu_shadow_done_q <= 1'b1;
-						end
 						SHADOW_SOURCE_STAGE: begin
 							save_stage_ddr_ack_pulse_q <= 1'b1;
 						end
@@ -1023,19 +1063,16 @@ module emu
 					endcase
 					shadow_ddr_source_q <= SHADOW_SOURCE_NONE;
 				end
-			end else if (cpu_shadow_req_w) begin
+			end else if (cpu_shadow_count_q != 4'd0) begin
 				shadow_ddr_busy_q <= 1'b1;
 				shadow_ddr_source_q <= SHADOW_SOURCE_CPU;
 				shadow_ddr_req_q <= 1'b1;
-				shadow_ddr_addr_q <= {4'd0, sram_cpu_addr_w[23:1]};
+				shadow_ddr_addr_q <= {4'd0, cpu_shadow_head_w[40:18]};
 				shadow_ddr_din_q <= shadow_write_data_fn(
-					sram_cpu_addr_w[2:1], sram_cpu_write_data_w);
+					cpu_shadow_head_w[19:18], cpu_shadow_head_w[17:2]);
 				shadow_ddr_rnw_q <= 1'b0;
 				shadow_ddr_be_q <= shadow_write_be_fn(
-					sram_cpu_addr_w[2:1], sram_cpu_be_w);
-				cpu_shadow_seen_valid_q <= 1'b1;
-				cpu_shadow_seen_tag_q <= ext_cycle_tag;
-				cpu_shadow_done_q <= 1'b0;
+					cpu_shadow_head_w[19:18], cpu_shadow_head_w[1:0]);
 			end else if (p1_shadow_req_w && !shadow_ddr_p1_seen_q) begin
 				shadow_ddr_busy_q <= 1'b1;
 				shadow_ddr_source_q <= SHADOW_SOURCE_P1;
@@ -1159,6 +1196,7 @@ module emu
 	vb_cart_rom u_cart (
 		.clk_sys             (clk_sys),
 		.clk_ram             (clk_ram),
+		.clk_ram_pin         (clk_ram_pin),
 		.reset_i             (!pll_locked),
 		.rom_download_i      (rom_download),
 		.ioctl_wr_i          (ioctl_wr),
@@ -1190,6 +1228,9 @@ module emu
 		.sram_bg_done_o      (p1_background_done_w),
 		.sram_bg_read_data_o (p1_response_data_w),
 		.foreground_idle_o   (sdram_foreground_idle_w),
+		.refresh_window_i    (cart_refresh_window_w),
+		.cpu_stopped_i       (cart_cpu_stopped_w),
+		.quiet_o             (cart_sdram_quiet_w),
 		.SDRAM_CLK           (SDRAM_CLK),
 		.SDRAM_CKE           (SDRAM_CKE),
 		.SDRAM_A             (SDRAM_A),
@@ -1401,7 +1442,8 @@ module emu
 	// modify canonical SDRAM, so only that direction requests a frame stop.
 	assign save_pause_busy = save_slot_load_active | cart_sram_init_busy |
 		cart_ram_clear_busy;
-	assign save_transfer_allowed = !cart_sram_init_busy &&
+	assign save_transfer_allowed = (cpu_shadow_count_q == 4'd0) &&
+		!cart_sram_init_busy &&
 		!cart_ram_clear_busy && !sleep_savestate && !savestate_busy &&
 		(!save_slot_load_active ||
 		 (!core_execution_enable && !video_source_enable));
@@ -1471,6 +1513,10 @@ module emu
 	assign VGA_SL = 2'd0;
 	assign AUDIO_MIX = status[39:38];
 
+	wire [15:0] vsu_audio_l;
+	wire [15:0] vsu_audio_r;
+	wire        vsu_audio_sample;
+
 	virtualboy #(
 		// The VIP-facing producer runs fast enough to service its synchronous
 		// framebuffer reads: 1,280 clocks at 20 MHz in normal mode and 2,560
@@ -1524,6 +1570,7 @@ module emu
 		.side_by_side_i                (side_by_side),
 		.compat_60hz_i                 (video_60hz_compat),
 		.parallax_scale_i              (stereo_scale),
+		.scanner_spinup_i              (status[30]),
 		.presentation_hlg_i            (presentation_hlg_enabled),
 		.brightness_table_legacy_sdr_i (brightness_table_legacy_sdr),
 		.brightness_table_download_i   (brightness_table_download),
@@ -1554,6 +1601,7 @@ module emu
 		.ext_cycle_tag_o               (ext_cycle_tag),
 		.ext_din_i                     (ext_din),
 		.ext_ready_i                   (cart_access_ready_w),
+		.cart_refresh_window_o         (cart_refresh_window_w),
 
 		.video_raw_l_o                 (video_raw_left_raw),
 		.video_raw_r_o                 (video_raw_right_raw),
@@ -1563,9 +1611,9 @@ module emu
 		.video_vblank_o                (video_vblank),
 		.video_hsync_o                 (),
 		.video_vsync_o                 (),
-		.audio_l_o                     (AUDIO_L),
-		.audio_r_o                     (AUDIO_R),
-		.audio_sample_valid_o          (),
+		.audio_l_o                     (vsu_audio_l),
+		.audio_r_o                     (vsu_audio_r),
+		.audio_sample_valid_o          (vsu_audio_sample),
 		.timer_tick_o                  (),
 		.timer_zero_o                  (),
 		.timer_irq_o                   (),
@@ -1589,6 +1637,31 @@ module emu
 	);
 
 	///////////////////////   VIDEO / AUDIO   ////////////////////////
+
+	// Console RC coupling, then a band-limited move to 48 kHz on CLK_AUDIO.
+	wire               audio_hp_sample;
+	wire signed [17:0] audio_hp_l;
+	wire signed [17:0] audio_hp_r;
+
+	vsu_rc_highpass u_audio_highpass (
+		.clk_i    (clk_sys),
+		.sample_i (vsu_audio_sample),
+		.left_i   (vsu_audio_l[15:6]),
+		.right_i  (vsu_audio_r[15:6]),
+		.sample_o (audio_hp_sample),
+		.left_o   (audio_hp_l),
+		.right_o  (audio_hp_r)
+	);
+
+	audio_resampler u_audio_resampler (
+		.src_clk_i    (clk_sys),
+		.src_sample_i (audio_hp_sample),
+		.src_left_i   (audio_hp_l),
+		.src_right_i  (audio_hp_r),
+		.clk_i        (CLK_AUDIO),
+		.left_o       (AUDIO_L),
+		.right_o      (AUDIO_R)
+	);
 
 	wire [1:0] ar = status[2:1];
 	wire video_active = video_source_enable && !core_reset &&
@@ -1832,13 +1905,14 @@ module vb_video_colorizer (
 	output reg  [7:0]  blue_o
 );
 
-	localparam [2:0] COLOR_MODE_RED        = 3'd0;
+	localparam [2:0] COLOR_MODE_NATURAL    = 3'd0;
 	localparam [2:0] COLOR_MODE_MULTICOLOR = 3'd1;
 	localparam [2:0] COLOR_MODE_PALETTE    = 3'd2;
 	localparam [2:0] COLOR_MODE_ANAGLYPH   = 3'd3;
 	localparam [2:0] COLOR_MODE_COLORCODE  = 3'd4;
 	localparam [2:0] COLOR_MODE_TRIOVIZ    = 3'd5;
 	localparam [2:0] COLOR_MODE_CUSTOM     = 3'd6;
+	localparam [2:0] COLOR_MODE_PURE_RED   = 3'd7;
 
 	function automatic [23:0] custom_eye_rgb_fn;
 		input [2:0] color_i;
@@ -1906,6 +1980,13 @@ module vb_video_colorizer (
 	);
 	wire [7:0] palette_blue = palette_blend_channel_fn(
 		palette_base_rgb[7:0], palette_target_rgb[7:0], combined_luma
+	);
+
+	wire [7:0] natural_blue;
+
+	vb_natural_red_tint u_natural_tint (
+		.red_i  (combined_luma),
+		.blue_o (natural_blue)
 	);
 
 	wire [7:0] multicolor_red;
@@ -2029,7 +2110,11 @@ module vb_video_colorizer (
 					green_o = custom_green;
 					blue_o = custom_blue;
 				end
-				COLOR_MODE_RED: begin
+				COLOR_MODE_NATURAL: begin
+					red_o = combined_luma;
+					blue_o = natural_blue;
+				end
+				COLOR_MODE_PURE_RED: begin
 					red_o = combined_luma;
 				end
 				default: begin
@@ -2073,6 +2158,62 @@ module vb_multicolor_luma_to_rgb (
 				green_o = luma_i;
 				blue_o = {3'b000, luma_i[7:3]};
 			end
+		endcase
+	end
+
+endmodule
+
+// Faint magenta tint: blue carries 1.97% of red's linear light, with both
+// channels sRGB encoded. Full red 255 pairs with blue 38.
+module vb_natural_red_tint (
+	input  wire [7:0] red_i,
+	output reg  [7:0] blue_o
+);
+
+	always @(*) begin
+		case (red_i)
+			8'd0, 8'd1, 8'd2, 8'd3, 8'd4, 8'd5, 8'd6, 8'd7, 8'd8, 8'd9, 8'd10, 8'd11,
+			8'd12, 8'd13, 8'd14, 8'd15, 8'd16, 8'd17, 8'd18, 8'd19, 8'd20, 8'd21: blue_o = 8'd0;
+			8'd22, 8'd23, 8'd24, 8'd25, 8'd26, 8'd27, 8'd28, 8'd29, 8'd30, 8'd31,
+			8'd32, 8'd33, 8'd34, 8'd35, 8'd36, 8'd37, 8'd38, 8'd39, 8'd40, 8'd41: blue_o = 8'd1;
+			8'd42, 8'd43, 8'd44, 8'd45, 8'd46, 8'd47, 8'd48, 8'd49, 8'd50, 8'd51,
+			8'd52, 8'd53, 8'd54, 8'd55: blue_o = 8'd2;
+			8'd56, 8'd57, 8'd58, 8'd59, 8'd60, 8'd61, 8'd62, 8'd63, 8'd64, 8'd65: blue_o = 8'd3;
+			8'd66, 8'd67, 8'd68, 8'd69, 8'd70, 8'd71, 8'd72, 8'd73, 8'd74: blue_o = 8'd4;
+			8'd75, 8'd76, 8'd77, 8'd78, 8'd79, 8'd80, 8'd81, 8'd82: blue_o = 8'd5;
+			8'd83, 8'd84, 8'd85, 8'd86, 8'd87, 8'd88, 8'd89: blue_o = 8'd6;
+			8'd90, 8'd91, 8'd92, 8'd93, 8'd94, 8'd95: blue_o = 8'd7;
+			8'd96, 8'd97, 8'd98, 8'd99, 8'd100, 8'd101: blue_o = 8'd8;
+			8'd102, 8'd103, 8'd104, 8'd105, 8'd106: blue_o = 8'd9;
+			8'd107, 8'd108, 8'd109, 8'd110, 8'd111, 8'd112: blue_o = 8'd10;
+			8'd113, 8'd114, 8'd115, 8'd116, 8'd117: blue_o = 8'd11;
+			8'd118, 8'd119, 8'd120, 8'd121, 8'd122: blue_o = 8'd12;
+			8'd123, 8'd124, 8'd125, 8'd126, 8'd127: blue_o = 8'd13;
+			8'd128, 8'd129, 8'd130, 8'd131, 8'd132: blue_o = 8'd14;
+			8'd133, 8'd134, 8'd135, 8'd136, 8'd137: blue_o = 8'd15;
+			8'd138, 8'd139, 8'd140, 8'd141, 8'd142: blue_o = 8'd16;
+			8'd143, 8'd144, 8'd145, 8'd146, 8'd147: blue_o = 8'd17;
+			8'd148, 8'd149, 8'd150, 8'd151, 8'd152, 8'd153: blue_o = 8'd18;
+			8'd154, 8'd155, 8'd156, 8'd157, 8'd158: blue_o = 8'd19;
+			8'd159, 8'd160, 8'd161, 8'd162, 8'd163: blue_o = 8'd20;
+			8'd164, 8'd165, 8'd166, 8'd167, 8'd168: blue_o = 8'd21;
+			8'd169, 8'd170, 8'd171, 8'd172, 8'd173: blue_o = 8'd22;
+			8'd174, 8'd175, 8'd176, 8'd177, 8'd178: blue_o = 8'd23;
+			8'd179, 8'd180, 8'd181, 8'd182, 8'd183: blue_o = 8'd24;
+			8'd184, 8'd185, 8'd186, 8'd187, 8'd188, 8'd189: blue_o = 8'd25;
+			8'd190, 8'd191, 8'd192, 8'd193, 8'd194: blue_o = 8'd26;
+			8'd195, 8'd196, 8'd197, 8'd198, 8'd199: blue_o = 8'd27;
+			8'd200, 8'd201, 8'd202, 8'd203, 8'd204: blue_o = 8'd28;
+			8'd205, 8'd206, 8'd207, 8'd208, 8'd209: blue_o = 8'd29;
+			8'd210, 8'd211, 8'd212, 8'd213, 8'd214: blue_o = 8'd30;
+			8'd215, 8'd216, 8'd217, 8'd218, 8'd219: blue_o = 8'd31;
+			8'd220, 8'd221, 8'd222, 8'd223, 8'd224, 8'd225: blue_o = 8'd32;
+			8'd226, 8'd227, 8'd228, 8'd229, 8'd230: blue_o = 8'd33;
+			8'd231, 8'd232, 8'd233, 8'd234, 8'd235: blue_o = 8'd34;
+			8'd236, 8'd237, 8'd238, 8'd239, 8'd240: blue_o = 8'd35;
+			8'd241, 8'd242, 8'd243, 8'd244, 8'd245: blue_o = 8'd36;
+			8'd246, 8'd247, 8'd248, 8'd249, 8'd250: blue_o = 8'd37;
+			default: blue_o = 8'd38;
 		endcase
 	end
 

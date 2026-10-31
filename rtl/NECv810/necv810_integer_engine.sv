@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Jamie Blanks
 
-// Iterative NEC V810 unit for MUL, DIV, MPYHW, and REV. The parent owns timing
-// and commit.
+// Iterative NEC V810 unit for MUL and DIV. The parent owns timing and commit.
 module necv810_integer_engine
 (
 	input  wire        clk_i,
@@ -25,8 +24,6 @@ module necv810_integer_engine
 	output wire        result_overflow_o
 );
 
-	localparam [3:0] LONG_REV   = 4'd4;
-	localparam [3:0] LONG_MPYHW = 4'd5;
 	localparam [3:0] LONG_MUL   = 4'd12;
 	localparam [3:0] LONG_DIV   = 4'd13;
 	localparam [3:0] LONG_MULU  = 4'd14;
@@ -40,24 +37,22 @@ module necv810_integer_engine
 	reg        rem_negate_q;
 	reg        mul_prep_q;
 	reg [63:0] acc_q;
-	reg [63:0] addend_q;
-	reg [63:0] multiplicand_q;
-	reg [63:0] multiplicand3_q;
+	reg [35:0] addend_q;
+	reg [31:0] multiplicand_q;
+	reg [33:0] multiplicand3_q;
 	reg [31:0] multiplier_q;
 	reg [31:0] divisor_q;
 	reg [31:0] quot_q;
 	reg [31:0] rem_q;
-	reg [31:0] shift_q;
-	reg [31:0] reverse_q;
 	reg [31:0] result_hi_q;
 	reg [31:0] result_lo_q;
 	reg        result_zero_q;
 	reg        result_sign_q;
 	reg        result_overflow_q;
 
-	wire        mul_kind_w = (kind_q == LONG_MUL) || (kind_q == LONG_MULU) ||
-		(kind_q == LONG_MPYHW);
-	wire [5:0]  mul_steps_w = (kind_q == LONG_MPYHW) ? 6'd5 : 6'd8;
+	wire        mul_kind_w = (kind_q == LONG_MUL) || (kind_q == LONG_MULU);
+	// Each digit adds into the top 32 bits; the sum shifts down four bits.
+	wire [35:0] mul_sum_w = {4'd0, acc_q[63:32]} + addend_q;
 	wire [63:0] product_final_w = negate_q ? neg64_fn(acc_q) : acc_q;
 	wire [32:0] div_shift_rem_w = {rem_q, quot_q[31]};
 	wire [31:0] div_shift_quot_w = {quot_q[30:0], 1'b0};
@@ -89,15 +84,13 @@ module necv810_integer_engine
 			rem_negate_q <= 1'b0;
 			mul_prep_q <= 1'b0;
 			acc_q <= 64'd0;
-			addend_q <= 64'd0;
-			multiplicand_q <= 64'd0;
-			multiplicand3_q <= 64'd0;
+			addend_q <= 36'd0;
+			multiplicand_q <= 32'd0;
+			multiplicand3_q <= 34'd0;
 			multiplier_q <= 32'd0;
 			divisor_q <= 32'd0;
 			quot_q <= 32'd0;
 			rem_q <= 32'd0;
-			shift_q <= 32'd0;
-			reverse_q <= 32'd0;
 			result_hi_q <= 32'd0;
 			result_lo_q <= 32'd0;
 			result_zero_q <= 1'b0;
@@ -106,11 +99,11 @@ module necv810_integer_engine
 		end else begin
 			// Form a radix-16 digit on phi1, then add it on CE.
 			if (phi1_i && busy_q && !done_q && mul_kind_w &&
-				(step_q < mul_steps_w)) begin
+				(step_q < 6'd8)) begin
 				if (!mul_prep_q) begin
-					// Precompute 3X so each radix-16 digit needs one 64-bit add.
+					// Precompute 3X so each radix-16 digit needs one add.
 					multiplicand3_q <=
-						(multiplicand_q << 1) + multiplicand_q;
+						{1'b0, multiplicand_q, 1'b0} + {2'd0, multiplicand_q};
 				end else begin
 					addend_q <= mul_digit_fn(
 						multiplicand_q, multiplicand3_q,
@@ -131,15 +124,13 @@ module necv810_integer_engine
 					rem_negate_q <= 1'b0;
 					mul_prep_q <= 1'b0;
 					acc_q <= 64'd0;
-					addend_q <= 64'd0;
-					multiplicand_q <= 64'd0;
-					multiplicand3_q <= 64'd0;
+					addend_q <= 36'd0;
+					multiplicand_q <= 32'd0;
+					multiplicand3_q <= 34'd0;
 					multiplier_q <= 32'd0;
 					divisor_q <= 32'd0;
 					quot_q <= 32'd0;
 					rem_q <= 32'd0;
-					shift_q <= 32'd0;
-					reverse_q <= 32'd0;
 					result_hi_q <= 32'd0;
 					result_lo_q <= 32'd0;
 					result_zero_q <= 1'b0;
@@ -148,19 +139,13 @@ module necv810_integer_engine
 					case (kind_i)
 						LONG_MUL: begin
 							negate_q <= lhs_i[31] ^ rhs_i[31];
-							multiplicand_q <= {32'd0, abs32_fn(lhs_i)};
+							multiplicand_q <= abs32_fn(lhs_i);
 							multiplier_q <= abs32_fn(rhs_i);
 						end
 
 						LONG_MULU: begin
-							multiplicand_q <= {32'd0, lhs_i};
+							multiplicand_q <= lhs_i;
 							multiplier_q <= rhs_i;
-						end
-
-						LONG_MPYHW: begin
-							negate_q <= lhs_i[31] ^ rhs_i[16];
-							multiplicand_q <= {32'd0, abs32_fn(lhs_i)};
-							multiplier_q <= abs32_fn(mpyhw_rhs_fn(rhs_i[16:0]));
 						end
 
 						LONG_DIV: begin
@@ -171,6 +156,12 @@ module necv810_integer_engine
 								result_zero_q <= 1'b0;
 								result_sign_q <= 1'b1;
 								result_overflow_q <= 1'b1;
+								done_q <= 1'b1;
+							end else if (rhs_i == 32'd1) begin
+								// The dividend is the quotient; no steps.
+								result_lo_q <= lhs_i;
+								result_zero_q <= (lhs_i == 32'd0);
+								result_sign_q <= lhs_i[31];
 								done_q <= 1'b1;
 							end else begin
 								negate_q <= lhs_i[31] ^ rhs_i[31];
@@ -185,10 +176,6 @@ module necv810_integer_engine
 							divisor_q <= rhs_i;
 						end
 
-						LONG_REV: begin
-							shift_q <= rhs_i;
-						end
-
 						default: begin
 							busy_q <= 1'b0;
 							done_q <= 1'b0;
@@ -200,14 +187,11 @@ module necv810_integer_engine
 				end else if (busy_q && !done_q) begin
 					case (kind_q)
 						LONG_MUL,
-						LONG_MULU,
-						LONG_MPYHW: begin
+						LONG_MULU: begin
 							if (!mul_prep_q) begin
 								mul_prep_q <= 1'b1;
-							end else if (step_q < mul_steps_w) begin
-								acc_q <= acc_q + addend_q;
-								multiplicand_q <= multiplicand_q << 4;
-								multiplicand3_q <= multiplicand3_q << 4;
+							end else if (step_q < 6'd8) begin
+								acc_q <= {mul_sum_w, acc_q[31:4]};
 								multiplier_q <= {4'd0, multiplier_q[31:4]};
 								step_q <= step_q + 6'd1;
 							end else begin
@@ -237,18 +221,6 @@ module necv810_integer_engine
 								result_zero_q <= (div_final_quot_w == 32'd0);
 								result_sign_q <= div_final_quot_w[31];
 								result_overflow_q <= 1'b0;
-								done_q <= 1'b1;
-							end
-						end
-
-						LONG_REV: begin
-							if (step_q < 6'd16) begin
-								reverse_q <= {
-									reverse_q[29:0], shift_q[0], shift_q[1]};
-								shift_q <= {2'd0, shift_q[31:2]};
-								step_q <= step_q + 6'd1;
-							end else begin
-								result_lo_q <= reverse_q;
 								done_q <= 1'b1;
 							end
 						end
@@ -283,31 +255,24 @@ module necv810_integer_engine
 		end
 	endfunction
 
-	function [31:0] mpyhw_rhs_fn;
-		input [16:0] value;
-		begin
-			mpyhw_rhs_fn = {{15{value[16]}}, value};
-		end
-	endfunction
-
-	function [63:0] mul_digit_fn;
-		input [63:0] multiplicand;
-		input [63:0] multiplicand3;
+	function [35:0] mul_digit_fn;
+		input [31:0] multiplicand;
+		input [33:0] multiplicand3;
 		input [3:0]  digit;
-		reg [63:0] low_v;
-		reg [63:0] high_v;
+		reg [35:0] low_v;
+		reg [35:0] high_v;
 		begin
 			case (digit[1:0])
-				2'd0: low_v = 64'd0;
-				2'd1: low_v = multiplicand;
-				2'd2: low_v = multiplicand << 1;
-				default: low_v = multiplicand3;
+				2'd0: low_v = 36'd0;
+				2'd1: low_v = {4'd0, multiplicand};
+				2'd2: low_v = {3'd0, multiplicand, 1'b0};
+				default: low_v = {2'd0, multiplicand3};
 			endcase
 			case (digit[3:2])
-				2'd0: high_v = 64'd0;
-				2'd1: high_v = multiplicand << 2;
-				2'd2: high_v = multiplicand << 3;
-				default: high_v = multiplicand3 << 2;
+				2'd0: high_v = 36'd0;
+				2'd1: high_v = {2'd0, multiplicand, 2'd0};
+				2'd2: high_v = {1'b0, multiplicand, 3'd0};
+				default: high_v = {multiplicand3, 2'd0};
 			endcase
 			mul_digit_fn = low_v + high_v;
 		end
