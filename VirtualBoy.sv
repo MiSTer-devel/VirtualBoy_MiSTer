@@ -129,7 +129,6 @@ module emu
 	///////// Default values for ports not used in this core /////////
 
 	assign ADC_BUS  = 'Z;
-	assign USER_OUT = '1;
 	assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 	assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 	`ifdef MISTER_DUAL_SDRAM
@@ -310,6 +309,7 @@ module emu
 		"P2-;",
 		"P2F4,VBT,Load Brightness Table;",
 		"P2-;",
+		"P2O[20],User IO,Off,SNAC (Controller);",
 		"P2O[40],Enable Large SRAM,Off,On;",
 		"P2O[28],Serial Port,Rumble,None;",
 		"P2O[30],Mirror Spin-up Delay,Off,On;",
@@ -1489,6 +1489,25 @@ module emu
 	};
 	wire [15:0] core_pad_buttons = tas_pad_override ? tas_pad_word : pad_buttons;
 
+	// SNAC uses the same signal pins as SNES SNAC:
+	// USER1 / USB 3.0 D- = clock, USER0 / USB 3.0 D+ = latch,
+	// USER5 / USB 3.0 RX- = data.
+	// USER_OUT is open-drain: one releases a pin and zero pulls it low.
+	wire       snac_active = status[20] && !tas_pad_override;
+	wire       snac_pad_clock;
+	reg  [1:0] snac_data_sync_q = 2'b11;
+
+	always @(posedge clk_sys) begin
+		if (!snac_active)
+			snac_data_sync_q <= 2'b11;
+		else
+			snac_data_sync_q <= {snac_data_sync_q[0], USER_IN[5]};
+	end
+
+	assign USER_OUT[0]   = snac_active ? tas_pad_latch : 1'b1;
+	assign USER_OUT[1]   = snac_active ? snac_pad_clock : 1'b1;
+	assign USER_OUT[6:2] = 5'b11111;
+
 	localparam [1:0] EYE_DRAW_LEFT         = 2'd0;
 	localparam [1:0] EYE_DRAW_RIGHT        = 2'd1;
 	localparam [1:0] EYE_DRAW_SIDE_BY_SIDE = 2'd3;
@@ -1560,6 +1579,8 @@ module emu
 		.cheat_code_i                  (cheat_code),
 
 		.pad_buttons_i                 (core_pad_buttons),
+		.pad_serial_enable_i           (snac_active),
+		.pad_serial_i                  (snac_data_sync_q[1]),
 		.cart_irq_i                    (1'b0),
 		.rumble_enable_i               (serial_rumble_enable),
 		.link_comcnt_i                 (1'b1),
@@ -1579,7 +1600,7 @@ module emu
 		.brightness_table_data_i       (brightness_table_data),
 
 		.pad_latch_o                   (tas_pad_latch),
-		.pad_clock_o                   (),
+		.pad_clock_o                   (snac_pad_clock),
 		.link_comcnt_o                 (),
 		.link_clk_o                    (),
 		.link_tx_o                     (),

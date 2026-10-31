@@ -11,12 +11,16 @@ Anaglyph 3D using colored glasses and side-by-side output for 3DTV's are both su
 ## Other Features
 Savestates, cheats, and other typical MiSTer features are supported. Additionally the third party rumble support is in the core.
 
+### SNAC
+Set `Advanced > User IO` to `SNAC` to use an original Virtual Boy controller through a level-shifting SNAC adapter. The core uses the SNES SNAC signal pins: clock is USER1 (USB 3.0 D-), latch is USER0 (USB 3.0 D+), and controller data is USER5 (USB 3.0 RX-). `Off` releases the USER port.
+
 ## Development
 Originally this was started as a fully hand written project, but like most contemporary development, AI was introduced and used for a lot of refactoring, auditing, and improvements. I know it is a controverial topic, but I can say with no hesitation that AI is an invaluable and game-changing tool for development of this nature. Like most tools, the quality of the results is largely dictated by the choices of the operator, and I feel this is no different. I strongly believe that in future, continued refinement of how we use AI in our development process will lead to results that are measurably higher quality than the results we can get without it. I don't claim we're at that point yet, but this marks some of my first attempts at using it this way. Amongst some of my experiments I had AI craft a suite of several test roms to run on real hardware which did comprehensive probes of the CPU and VIP to gather data on several of the silicon unknowns as best you can without a physical logic analyzer connected. The interpreted results yielded significant new hardware insights which allowed these chips to be implemented with more accuracy than previously possible in emulators.
 
 ## QA
-- Guy's Cycle Test shows cycle accurate CPU timings to a real system, although it is likely not 100% cycle accurate because the pipelining is not well charactertized or understood by the existing knowledge pool.
-- Guy's Speed Profile shows close, but not perfect bus timings. This is likely due to minor differences in the VIP RAM arbitration or cpu pipelining. They are closer than any other emulator I tried though.
+- Guy's Cycle Test shows cycle accurate CPU timings to a real system.
+- Guy's Speed Profile shows exact accuracy for the CPU related reads and writes which qualified memory and pipelining timings. VIP access is within 0.5% of a real system.
 - Extensive CPU audits were done against opcode sanity, output sanity, opcode timing, and reference matching.
-- The VIP is largely a black box, but every retail title and all homebrew known to me was tested for accuracy until no defects were found in any of the video.
+- Roughly 6300 tests were made against the CPU and VIP to examine real system behavior and timing and the core is within matching ranges for about 6000 of them. The remaining ones are still close but vary a bit more.
+- Every retail title and all homebrew known to me was tested for accuracy until no defects were found in any of the video.
 - Audio captures from the real system were programatically compared to captures from the core to test for accuracy. Many of the most difficult audio edge cases such as "Wario is gonna win" "Virtual Bowling" and "Galactic Pinball" voices all are real-system accurate in pitch and quality.

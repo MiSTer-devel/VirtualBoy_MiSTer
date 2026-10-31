@@ -221,6 +221,8 @@ module vb_vue_io
 	input  wire        ce_i,
 
 	input  wire [15:0] pad_sample_i,
+	input  wire        pad_serial_enable_i,
+	input  wire        pad_serial_i,
 	input  wire        link_comcnt_i,
 	input  wire        link_clk_i,
 	input  wire        link_rx_i,
@@ -374,6 +376,8 @@ module vb_vue_io
 
 	// STS: IRQ is high when bits 15:4 contain a press and bits 3:1 are clear.
 	wire        pad_irq_shift_match_w = (|pad_shift_q[15:4]) && (~|pad_shift_q[3:1]);
+	// Virtual Boy pads use the NES/SNES active-low serial data convention.
+	wire        pad_serial_bit_w = ~pad_serial_i;
 	wire        comm_cc_rd_w = comm_cc_wr_q & link_comcnt_i;
 	// A link bit shifts on this edge; the eighth one ends the byte.
 	wire        comm_shift_w = comm_busy_q && (comm_clk_sel_q ?
@@ -547,16 +551,19 @@ module vb_vue_io
 					pad_irq_en_n_q <= value[7];
 					if (value[5]) begin
 						pad_para_si_q     <= 1'b1;
-						pad_shift_q       <= pad_sample_i;
+						pad_shift_q       <= pad_serial_enable_i ? 16'h0000 : pad_sample_i;
 						pad_capture_q     <= 16'h0000;
 						pad_shift_count_q <= 5'd0;
 					end else begin
 						pad_para_si_q <= 1'b0;
 						if (pad_soft_ck_q && !value[4] && (pad_shift_count_q < 5'd16)) begin
-							pad_capture_q <= {pad_capture_q[14:0], pad_shift_q[15]};
-							pad_shift_q   <= {pad_shift_q[14:0], 1'b0};
+							pad_capture_q <= {pad_capture_q[14:0],
+								pad_serial_enable_i ? pad_serial_bit_w : pad_shift_q[15]};
+							pad_shift_q   <= {pad_shift_q[14:0],
+								pad_serial_enable_i ? pad_serial_bit_w : 1'b0};
 							if (pad_shift_count_q == 5'd15) begin
-								pad_data_q <= {pad_capture_q[14:0], pad_shift_q[15]};
+								pad_data_q <= {pad_capture_q[14:0],
+									pad_serial_enable_i ? pad_serial_bit_w : pad_shift_q[15]};
 							end
 							pad_shift_count_q <= pad_shift_count_q + 5'd1;
 						end
@@ -566,7 +573,7 @@ module vb_vue_io
 					if (value[2] && !value[0] && !pad_abort_q &&
 						!pad_busy_q) begin
 						pad_busy_q          <= 1'b1;
-						pad_shift_q         <= pad_sample_i;
+						pad_shift_q         <= pad_serial_enable_i ? 16'h0000 : pad_sample_i;
 						pad_capture_q       <= 16'h0000;
 						pad_shift_count_q   <= 5'd0;
 						pad_hw_edge_count_q <= 6'd0;
@@ -808,6 +815,10 @@ module vb_vue_io
 								pad_hw_edge_count_q <= 6'd0;
 							end
 						end else begin
+							// Sample before the next rising edge advances the pad.
+							if (pad_serial_enable_i && pad_hw_clock_q) begin
+								pad_shift_q <= {pad_shift_q[14:0], pad_serial_bit_w};
+							end
 							pad_hw_clock_q <= ~pad_hw_clock_q;
 							if (pad_hw_edge_count_q != 6'd31) begin
 								pad_hw_edge_count_q <= pad_hw_edge_count_q + 6'd1;

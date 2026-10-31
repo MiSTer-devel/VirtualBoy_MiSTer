@@ -47,6 +47,8 @@ module vb_nvc
 	input  wire         cart_irq_i,
 
 	input  wire [15:0]  pad_sample_i,
+	input  wire         pad_serial_enable_i,
+	input  wire         pad_serial_i,
 	output wire         pad_latch_o,
 	output wire         pad_clock_o,
 
@@ -229,6 +231,8 @@ module vb_nvc
 		.ce_i                    (ce_i),
 
 		.pad_sample_i            (pad_sample_i),
+		.pad_serial_enable_i     (pad_serial_enable_i),
+		.pad_serial_i            (pad_serial_i),
 		.link_comcnt_i           (link_comcnt_i),
 		.link_clk_i              (link_clk_i),
 		.link_rx_i               (link_rx_i),
