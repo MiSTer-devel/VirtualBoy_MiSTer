@@ -147,6 +147,8 @@ module necv810_bus_engine #(
 	// halfword of the store on the bus is written: all of a byte or
 	// halfword, the low half of a word.
 	// ---------------------------------------------------------------
+	reg        push_wait_q;
+	reg        fetch_wait_q;
 	reg        wb0_q;
 	reg [31:0] wb0_addr_q;
 	reg        wb0_io_q;
@@ -162,19 +164,21 @@ module necv810_bus_engine #(
 	// The request for the next cycle. A fetch waits only for a due store;
 	// other cycles wait for the buffer to drain, which keeps memory order.
 	wire        bus_owned_w = !hold_q && (!hldrq_s_q || lock_i);
-	wire        launch_ready_w = bus_owned_w && !busy_w &&
+	// A waiting store can use the boundary that completes its predecessor.
+	wire        push_bypass_w = bus_owned_w && complete_w && posted_q && !wb0_q && push_i && push_wait_q && !fetch_wait_q;
+	wire        launch_ready_w = bus_owned_w && !busy_w && !push_bypass_w &&
 		(launch_fetch_i ? !wb_due_w : (!wb0_q && !push_i));
 	wire        launch_accept_w = clk_en_i && launch_i && launch_ready_w;
-	wire        req_w = bus_owned_w && (wb_due_w || (launch_i && launch_ready_w));
-	wire        req_store_w = wb_due_w;
+	wire        req_w = bus_owned_w && (wb_due_w || push_bypass_w || (launch_i && launch_ready_w));
+	wire        req_store_w = wb_due_w || push_bypass_w;
 	wire        req_fetch_w = !req_store_w && launch_fetch_i;
 	wire        req_write_w = req_store_w || launch_write_i;
-	wire [31:0] req_addr_w = req_store_w ? wb0_addr_q : launch_addr_i;
-	wire [1:0]  req_size_w = req_store_w ? wb0_size_q : launch_size_i;
-	wire        req_io_w = req_store_w ? wb0_io_q : launch_io_i;
-	wire        req_err_w = req_store_w ? wb0_err_q : launch_addr_error_i;
+	wire [31:0] req_addr_w = push_bypass_w ? push_addr_i : req_store_w ? wb0_addr_q : launch_addr_i;
+	wire [1:0]  req_size_w = push_bypass_w ? push_size_i : req_store_w ? wb0_size_q : launch_size_i;
+	wire        req_io_w = push_bypass_w ? push_io_i : req_store_w ? wb0_io_q : launch_io_i;
+	wire        req_err_w = push_bypass_w ? push_addr_error_i : req_store_w ? wb0_err_q : launch_addr_error_i;
 	wire [1:0]  req_sys_w = req_store_w ? 2'b00 : launch_sys_i;
-	wire [31:0] req_wdata_w = req_store_w ? wb0_data_q : launch_wdata_i;
+	wire [31:0] req_wdata_w = push_bypass_w ? push_wdata_i : req_store_w ? wb0_data_q : launch_wdata_i;
 	wire        start_w = clk_en_i && !busy_w && req_w;
 
 	// ---------------------------------------------------------------
@@ -296,6 +300,8 @@ module necv810_bus_engine #(
 
 	always @(posedge clk_i or posedge reset_i) begin
 		if (reset_i) begin
+			push_wait_q <= 1'b0;
+			fetch_wait_q <= 1'b0;
 			wb0_q <= 1'b0;
 			wb0_addr_q <= 32'd0;
 			wb0_io_q <= 1'b0;
@@ -303,9 +309,15 @@ module necv810_bus_engine #(
 			wb0_size_q <= 2'b01;
 			wb0_data_q <= 32'd0;
 		end else if (clk_en_i) begin
+			push_wait_q <= push_i && !push_accept_w;
+			// Preserve a fetch that waited before MEM needed the bus.
+			if (!launch_i || !launch_fetch_i || launch_accept_w)
+				fetch_wait_q <= 1'b0;
+			else if (!wb_due_w && !push_i)
+				fetch_wait_q <= 1'b1;
 			if (start_w && req_store_w) wb0_q <= 1'b0;
 			if (push_accept_w) begin
-				wb0_q <= 1'b1;
+				wb0_q <= !push_bypass_w;
 				wb0_addr_q <= push_addr_i;
 				wb0_io_q <= push_io_i;
 				wb0_err_q <= push_addr_error_i;

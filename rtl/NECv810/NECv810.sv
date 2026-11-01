@@ -744,9 +744,9 @@ module NECv810
 	assign data_busy_w = (mem_v_q && mem_store_q) || eng_store_pending_w ||
 		(eng_active_w && !eng_active_fetch_w);
 
-	// Stores stage as they leave MEM.
+	// A store keeps its request visible while MEM waits.
 	wire        mem_adv_w;
-	wire        push_w = mem_adv_w && mem_store_q;
+	wire        push_w = mem_v_q && mem_store_q;
 
 	necv810_bus_engine #(
 		.IO_MRQ(IO_MRQ)
