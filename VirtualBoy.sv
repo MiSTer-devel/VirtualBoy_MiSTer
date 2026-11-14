@@ -322,6 +322,8 @@ module emu
 		"-;",
 		"R0,Reset;",
 		"J1,A,B,L,R,Select,Start,R.Right,R.Left,R.Down,R.Up,Save State;",
+		"jn,A,B,L,R,Select,Start,RX_RIGHT,RX_LEFT,RY_DOWN,RY_UP;",
+		"jp,A,B,L,R,Select,Start,RX_RIGHT,RX_LEFT,RY_DOWN,RY_UP;",
 		"v,15;",
 		"V,v",`BUILD_DATE
 	};
